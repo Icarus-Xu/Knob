@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 固定浅色主题（AppCompat，不依赖 Material），避免车机暗色模式下文字看不清 -->
+    <style name="Theme.Knob" parent="Theme.AppCompat.Light.DarkActionBar" />
+</resources>

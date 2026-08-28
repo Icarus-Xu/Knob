@@ -1,0 +1,20 @@
+# 插件工程（纯 JVM + Kotlin，产出 plugin.dex）构建产物与本机环境
+
+# Gradle
+.gradle/
+build/
+.kotlin/
+
+# 本机环境
+local.properties
+
+# IDE
+.idea/
+*.iml
+
+# pluginDex 产物（可随时用 `./gradlew pluginDex` 重建）
+output/
+
+# 注意：libs/ 下的车机厂商官方 SDK 是编译必需的（compileOnly），但属于第三方专有
+# 组件，不入公开仓库 —— 忽略规则在仓库根 .gitignore 的「不公开的本地资料」一节。
+# 克隆后需自行把 bydauto-openapi.jar 放回 plugin/libs/ 才能编译插件。

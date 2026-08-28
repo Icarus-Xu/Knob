@@ -1,0 +1,24 @@
+# 仓库级忽略。Gradle / Android 构建产物的规则下沉到各子工程：
+#   app/.gitignore     壳 App（Android 工程）
+#   plugin/.gitignore  插件工程（纯 JVM，产出 plugin.dex）
+
+# 编辑器 / IDE
+.idea/
+*.iml
+.vscode/
+
+# 本机环境（不入库）
+local.properties
+
+# 不入公开仓库的本地资料（文件保留在本地工作区）
+#   plugin/libs/   第三方专有 SDK
+#   docs/evidence/ 实车日志，含车机指纹与已安装应用清单
+#   docs/local/    立项阶段的调研笔记与参考资料
+plugin/libs/
+docs/evidence/
+docs/local/
+
+# 系统/编辑器杂项
+.DS_Store
+*.swp
+*~

@@ -1,0 +1,22 @@
+# 壳 App（Android 工程）构建产物与本机环境
+
+# Gradle
+.gradle/
+build/
+.kotlin/
+
+# 本机环境（Android Studio 会自动重建）
+local.properties
+
+# Android Studio
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 打包产物：APK 本体 + AGP 拷到模块目录下的成品与元数据
+*.apk
+*.aab
+app/debug/
+app/release/
