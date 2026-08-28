@@ -39,6 +39,7 @@
 │           ├── MainPlugin.kt      # KnobPlugin 接口实现（入口 + 页面栈）
 │           ├── CarControl.kt      # 车控引擎（BYDAUTO 调用）
 │           └── PluginSelfTest.kt  # 一键全量自检
+├── firmware/             # 旋钮固件（PlatformIO，ESP32-S3+GC9A01+EC11，最小硬件调试，暂不连车机/BLE）
 ├── store/                # 应用商店素材（图标 + 预览图）
 └── docs/                 # 全部分析知识 / 方案 / 证据
     ├── INDEX.md          # ← 文档索引（先读这个）
