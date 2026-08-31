@@ -25,7 +25,7 @@ void display_init() {
     Arduino_DataBus *bus = new Arduino_HWSPI(TFT_DC, TFT_CS, TFT_SCLK, TFT_MOSI, TFT_MISO);
     screen = new SCREEN_CLASS(bus, TFT_RST, /*rotation=*/2, /*IPS=*/true);
     screen->begin();
-    screen->fillScreen(BLACK);
+    screen->fillScreen(RGB565_BLACK);
 
     pinMode(TFT_BLK, OUTPUT);
     digitalWrite(TFT_BLK, HIGH); // 打开背光

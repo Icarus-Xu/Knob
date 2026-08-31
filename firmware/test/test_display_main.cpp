@@ -26,7 +26,7 @@ void setup() {
 
 // 依次填充几种纯色再画一行字：颜色对了 = SPI 接线和驱动没问题，
 // 文字方向正常（不是倒的/镜像的）= rotation 参数跟屏幕的物理装配方向一致。
-static const uint16_t COLORS[] = {RED, GREEN, BLUE, WHITE, BLACK};
+static const uint16_t COLORS[] = {RGB565_RED, RGB565_GREEN, RGB565_BLUE, RGB565_WHITE, RGB565_BLACK};
 static const int COLOR_COUNT = sizeof(COLORS) / sizeof(COLORS[0]);
 static int s_color_idx = 0;
 
@@ -34,7 +34,7 @@ void loop() {
     uint16_t bg = COLORS[s_color_idx];
     screen->fillScreen(bg);
     screen->setCursor(40, 110);
-    screen->setTextColor(bg == BLACK ? WHITE : BLACK);
+    screen->setTextColor(bg == RGB565_BLACK ? RGB565_WHITE : RGB565_BLACK);
     screen->setTextSize(2);
     screen->print("HELLO");
     Serial.printf("[TestDisplay] fill color #%d\n", s_color_idx);
