@@ -83,8 +83,13 @@ object BleManager {
             logBoth("未找到已配对的 Knob 设备（名字以 \"$DEVICE_NAME_PREFIX\" 开头），先去蓝牙设置配对，配对后可以重新触发一次 init()", isWarning = true)
             return
         }
-        logBoth("找到已配对设备 ${knob.name}，发起 GATT 连接")
-        gatt = knob.connectGatt(context, /* autoConnect = */ true, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        logBoth("找到已配对设备 ${knob.name}（bondState=${knob.bondState}），发起 GATT 连接")
+        // autoConnect=false（直连）而不是 true：设备这时候已经在系统蓝牙里
+        // 配对/连接着了，不是"以后随时可能出现"的场景。之前用 true 观察到
+        // 会触发一次独立于系统 HID 连接的全新配对（弹出跟系统配对时不一样
+        // 的 6 位数），怀疑是 autoConnect 走的后台自动重连路径在某些机型/
+        // 车机蓝牙栈上没有正确复用已有的连接和绑定信息。
+        gatt = knob.connectGatt(context, /* autoConnect = */ false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -96,7 +101,11 @@ object BleManager {
                     g.discoverServices()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    logBoth("GATT 断开（status=$status），autoConnect 会在设备重新出现时自动重连", isWarning = true)
+                    // autoConnect=false 下断开不会自动重连，得关掉这个 GATT
+                    // 对象、清空状态，下次调 init() 才会重新发起连接。
+                    logBoth("GATT 断开（status=$status），已停止，下次调用 init() 会重新连接", isWarning = true)
+                    g.close()
+                    gatt = null
                     characteristic = null
                 }
             }
