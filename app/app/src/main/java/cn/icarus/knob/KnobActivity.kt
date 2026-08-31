@@ -1,6 +1,7 @@
 package cn.icarus.knob
 
 import android.content.ContentValues
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -9,6 +10,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.provider.Settings
 import android.view.KeyEvent
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -16,6 +18,7 @@ import androidx.appcompat.app.AppCompatActivity
 import cn.icarus.knob.databinding.ActivityKnobBinding
 import cn.icarus.knob.host.KnobHostImpl
 import cn.icarus.knob.plugin.PluginLoader
+import cn.icarus.knob.service.KnobAccessibilityService
 import cn.icarus.knob.util.CrashHandler
 import cn.icarus.knob.util.LogSink
 import java.io.File
@@ -59,6 +62,7 @@ class KnobActivity : AppCompatActivity() {
         // 所有信息直接打进日志
         logSystemInfo()
         logPermissionStatus()
+        logAccessibilityStatus()
         logPluginStatus()
 
         binding.btnPickPlugin.setOnClickListener {
@@ -174,6 +178,22 @@ class KnobActivity : AppCompatActivity() {
             } catch (e: Throwable) { false }
             val short = perm.removePrefix("android.permission.")
             LogSink.append(if (granted) "✅ $short 已授权" else "❌ $short 未授权")
+        }
+    }
+
+    /**
+     * 无障碍服务权限没法用普通权限弹窗授权（安卓故意不提供这个 API，
+     * 必须用户在系统设置里手动开）——这里只能帮着跳到无障碍设置列表页，
+     * 剩下的开关+确认弹窗还是得用户自己点。
+     */
+    private fun logAccessibilityStatus() {
+        LogSink.section("无障碍服务状态")
+        if (KnobAccessibilityService.isRunning) {
+            LogSink.append("✅ 无障碍服务已开启")
+        } else {
+            LogSink.append("❌ 无障碍服务未开启，正在跳转到设置页面...")
+            Toast.makeText(this, "请在列表里找到「Knob」并开启无障碍权限", Toast.LENGTH_LONG).show()
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
     }
 

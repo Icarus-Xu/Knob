@@ -6,6 +6,8 @@ import android.os.Looper
 import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import cn.icarus.knob.plugin.PluginLoader
+import cn.icarus.knob.util.LogSink
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -105,12 +107,25 @@ class KnobAccessibilityService : AccessibilityService() {
         // 记录系统按键（旋钮映射的方向键/媒体键会到这里）
         keyCount.incrementAndGet()
         val kc = event.keyCode
+        val action = if (event.action == KeyEvent.ACTION_DOWN) "按下" else "抬起"
         synchronized(eventLog) {
-            eventLog.addLast("[按键] code=$kc action=${if (event.action == KeyEvent.ACTION_DOWN) "按下" else "抬起"}")
+            eventLog.addLast("[按键] code=$kc action=$action")
             while (eventLog.size > 60) eventLog.removeFirst()
         }
-        // 返回 false 表示不消费，让系统继续处理
-        return super.onKeyEvent(event)
+        LogSink.append("[无障碍-按键] code=$kc action=$action")
+
+        // 先转发给插件（真正的车控逻辑在插件里，参见 KnobPlugin.onEvent
+        // 的接口注释——"key" 事件本来就该走这条路）；插件没吃（没加载
+        // 插件，或者插件不关心这个键）时壳自己兜底吃掉，保证旋钮的按键
+        // 永远不会漏给当前车机界面（不吃的话方向键会移动焦点、确认键会
+        // 点到聚焦的控件，是安全隐患）。同一个键按下/抬起要么都被插件
+        // 消费要么都不消费，这个一致性由插件自己的实现保证。
+        val consumedByPlugin = PluginLoader.current?.onEvent("key", mapOf(
+            "code" to kc,
+            "action" to event.action
+        )) ?: false
+        LogSink.append(if (consumedByPlugin) "  → 插件已处理" else "  → 插件未处理，壳兜底吃掉")
+        return true
     }
 
     override fun onInterrupt() {}
