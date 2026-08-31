@@ -1,12 +1,15 @@
-// Knob 最小硬件调试固件。
-// 目标：屏幕显示 UI + 旋转旋钮调数值 + 按压切换功能 + 长按"确认"——
-// 全部在本地模拟，暂不连车机、不做蓝牙。方案见
-// docs/旋钮-最小硬件调试方案.md。
+// Knob 固件。
+// 屏幕显示 UI + 旋转旋钮调数值 + 按压切换功能 + 长按"确认"——数值本身
+// 还是本地模拟（没有真的接车控），但旋钮的每个动作现在会同步通过 BLE
+// HID 发给配对的手机/车机：旋转→左右方向键，单击→Tab，长按→Enter。
+// 方案见 docs/旋钮-最小硬件调试方案.md、docs/蓝牙控制配件-方案.md。
 
 #include <Arduino.h>
 #include "config.h"
 #include "display.h"
 #include "encoder.h"
+#include "ble.h"
+#include <HijelHID_BLEKeyboard.h> // KEY_LEFT / KEY_RIGHT / KEY_TAB / KEY_RETURN 常量
 
 // 旋钮能控制的一个"功能"。这个 demo 不会真的去控制任何车上的
 // 硬件——转动旋钮只是在改内存里的 value 变量、然后重绘屏幕，
@@ -91,6 +94,7 @@ void setup() {
 
     display_init();
     encoder_init();
+    ble_init();
     build_ui();
 
     Serial.println("[Knob] ready: rotate = adjust, click = switch function, long-press = confirm");
@@ -110,21 +114,35 @@ void loop() {
         if (f.value > f.max_value) f.value = f.max_value;
         refresh_ui();
         Serial.printf("[ENC] %s = %.1f\n", f.name, f.value);
+
+        // 快转一下可能一次性攒了好几档（见 encoder_get_diff 的说明），
+        // 这里按实际档数补发对应次数的方向键，不是只发一下。
+        if (ble_is_paired()) {
+            uint8_t key = diff > 0 ? KEY_RIGHT : KEY_LEFT;
+            for (int16_t i = 0; i < abs(diff); i++) {
+                ble_tap(key);
+            }
+        }
     }
 
     if (encoder_take_click()) {
         s_current_func = (s_current_func + 1) % FUNC_COUNT; // 转到最后一个之后回到第一个
         refresh_ui();
         Serial.printf("[BTN] switch -> %s\n", s_functions[s_current_func].name);
+        if (ble_is_paired()) {
+            ble_tap(KEY_TAB);
+        }
     }
 
     if (encoder_take_long_press()) {
-        // 这个 demo 还没接车机/蓝牙，长按并没有真正的东西可以"确认"——
-        // 这里先打日志，并把圆弧闪一下绿色，让你能直观看到长按被
-        // 正确识别到了。
+        // 长按 = 确认：本地把圆弧闪一下绿色给你看，同时给配对的主机发
+        // 一个 Enter。
         Serial.printf("[BTN] confirm %s = %.1f\n", s_functions[s_current_func].name,
                        s_functions[s_current_func].value);
         lv_obj_set_style_arc_color(s_arc, lv_palette_main(LV_PALETTE_GREEN), LV_PART_INDICATOR);
+        if (ble_is_paired()) {
+            ble_tap(KEY_RETURN);
+        }
     }
 
     display_task_handler(); // 让 LVGL 把刚才的改动画出来
