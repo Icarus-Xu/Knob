@@ -2,6 +2,7 @@ package cn.icarus.knob
 
 import android.app.Application
 import android.content.Context
+import cn.icarus.knob.ble.BleManager
 import cn.icarus.knob.host.KnobHostImpl
 import cn.icarus.knob.plugin.PluginLoader
 import cn.icarus.knob.util.LogSink
@@ -18,6 +19,9 @@ class KnobApp : Application() {
     override fun onCreate() {
         super.onCreate()
         context = applicationContext
+        // 常驻后台时 knob 断电重启也能自动把 GATT 通道接回去，不用等
+        // Activity 回到前台，见 BleManager.startReconnectPolling。
+        BleManager.startReconnectPolling(this)
         try {
             val plugin = PluginLoader.load(this)
             plugin?.let {

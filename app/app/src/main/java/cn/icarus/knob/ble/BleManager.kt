@@ -12,6 +12,8 @@ import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import cn.icarus.knob.util.LogSink
 import java.util.UUID
@@ -57,6 +59,36 @@ object BleManager {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true // API < 31 不需要运行时申请
         return context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) ==
             PackageManager.PERMISSION_GRANTED
+    }
+
+    /** GATT 是不是已经连上（可以直接 write() 了还得看 characteristic 是否也发现了，这里只看连接本身）。 */
+    fun isConnected(): Boolean = gatt != null
+
+    private const val RECONNECT_POLL_INTERVAL_MS = 15_000L
+    private val pollHandler = Handler(Looper.getMainLooper())
+    private var pollingStarted = false
+
+    // 本来想用 ACTION_ACL_CONNECTED 广播做事件驱动重连，实测这台车机的
+    // 蓝牙栈重连 knob 时压根不发这个广播（系统蓝牙设置界面显示已连接，
+    // 但广播接收器完全没收到）——跟之前遇到的双重配对问题一样，这台车机
+    // 的蓝牙栈很多地方不按标准 AOSP 行为来，不值得继续在广播上找解法。
+    // 改成定时轮询：每 15 秒检查一下有没有连上，没连上就重试 init()，
+    // 不依赖任何厂商可能不发的系统广播，也不依赖 Activity 在不在前台。
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            if (!isConnected()) init(appContext)
+            pollHandler.postDelayed(this, RECONNECT_POLL_INTERVAL_MS)
+        }
+    }
+
+    private lateinit var appContext: Context
+
+    /** 启动重连轮询，进程生命周期内只需要调一次（在 KnobApp.onCreate() 里调用）。 */
+    fun startReconnectPolling(context: Context) {
+        if (pollingStarted) return
+        pollingStarted = true
+        appContext = context.applicationContext
+        pollHandler.postDelayed(pollRunnable, RECONNECT_POLL_INTERVAL_MS)
     }
 
     /**
