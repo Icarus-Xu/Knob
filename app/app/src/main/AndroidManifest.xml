@@ -4,6 +4,11 @@
     <!-- 探测用权限：读已安装应用 -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
+    <!-- 蓝牙：BleManager 用来对已配对的 knob 发起 GATT 写入 -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
     <!-- 车机厂商车控 HAL 权限（座椅通风在 Setting 设备，空调在 AC 设备） -->
     <uses-permission android:name="android.permission.BYDAUTO_SETTING_GET" />
     <uses-permission android:name="android.permission.BYDAUTO_SETTING_SET" />

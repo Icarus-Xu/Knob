@@ -24,23 +24,41 @@ import cn.icarus.knob.api.Ui
  */
 class MainPlugin : KnobPlugin {
 
+    companion object {
+        // module: 0=空调温度, 1=座椅通风。范围/默认值对应 CarControl 里
+        // 已验证过的真实 BYDAUTO 常量，不是编出来的数字。
+        private val MIN_VALUE = intArrayOf(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.SEAT_VENTILATING_OFF)
+        private val MAX_VALUE = intArrayOf(CarControl.AC_TEMP_CELSIUS_MAX, CarControl.SEAT_VENTILATING_HIGH)
+        private val DEFAULT_VALUE = intArrayOf(22, CarControl.SEAT_VENTILATING_OFF)
+    }
+
     private val tag = "KnobPlugin"
 
     private var carControl: CarControl? = null
     private var selfTest: PluginSelfTest? = null
     private var appContext: Context? = null
+    private var host: KnobHost? = null
 
     // ---- 页面栈（壳提供容器，插件自管多页面跳转）----
     private var pageContainer: ViewGroup? = null
     private val pageStack = ArrayDeque<View>()
 
+    // ---- 旋钮当前控制的车控模块 + 数值（单一数据源，屏幕/日志都从这来）----
+    // module: 0=空调温度(17-33°C), 1=座椅通风(1=关/2=低/3=高)
+    private var currentModule = 0
+    private var currentValue = DEFAULT_VALUE[0]
+
     override fun init(context: Context, host: KnobHost) {
         Log.i(tag, "MainPlugin.init 调用")
         appContext = context
+        this.host = host
         // 初始化车控引擎（日志转发给壳）
         carControl = CarControl(host)
         selfTest = PluginSelfTest(carControl!!, host)
         host.log("✅ 插件初始化完成（车控引擎已就绪）")
+        // 插件一加载就同步一次默认状态，不等"蓝牙已连接"这个信号——壳
+        // 目前也没有真的推送这个状态给插件，直接同步即可。
+        syncToKnob()
     }
 
     /** 统一结果 Map：success 是否成功 / code 返回码 / value 结果 / message 说明。null 的 code/value 不放入。 */
@@ -237,6 +255,7 @@ class MainPlugin : KnobPlugin {
      * 按键处理，返回是否消费。
      *
      * 返回键：页面栈里还有上一页时由插件吃掉（抬起时出栈），栈底则交还给壳去关闭 Activity。
+     * 旋钮映射：Tab=切换模块，DPAD Left/Right=调整当前模块的值，Enter=应用。
      * 按下和抬起都要消费，只吃一半会让系统的按键状态错乱。
      */
     private fun handleKey(code: Int, action: Int): Boolean {
@@ -245,9 +264,51 @@ class MainPlugin : KnobPlugin {
             if (action == KeyEvent.ACTION_UP) popPage()
             return true
         }
-        Log.i(tag, "onEvent key code=$code action=$action")
-        // TODO: 在这里按 keyCode 映射到具体车控命令（路线图阶段 5）
+        when (code) {
+            KeyEvent.KEYCODE_TAB -> {
+                if (action == KeyEvent.ACTION_UP) {
+                    currentModule = 1 - currentModule
+                    currentValue = DEFAULT_VALUE[currentModule]
+                    host?.log("🔀 Tab -> module=$currentModule value=$currentValue")
+                    syncToKnob()
+                }
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                if (action == KeyEvent.ACTION_UP) {
+                    val delta = if (code == KeyEvent.KEYCODE_DPAD_RIGHT) 1 else -1
+                    currentValue = (currentValue + delta)
+                        .coerceIn(MIN_VALUE[currentModule], MAX_VALUE[currentModule])
+                    host?.log("🎚 DPAD -> module=$currentModule value=$currentValue")
+                    syncToKnob()
+                }
+                return true
+            }
+            KeyEvent.KEYCODE_ENTER -> {
+                if (action == KeyEvent.ACTION_UP) applyCurrent()
+                return true
+            }
+        }
+        Log.i(tag, "onEvent key code=$code action=$action（未处理）")
         return false
+    }
+
+    /** 把当前模块+数值同步给旋钮屏幕（走 host.pushToKnob -> BLE -> ESP32）。 */
+    private fun syncToKnob() {
+        host?.pushToKnob(mapOf("module" to currentModule, "value" to currentValue))
+    }
+
+    /**
+     * Enter：应用当前模块的数值。先不真的调用车控接口（在手机上测试阶段，
+     * 没有车、调了也没有意义），只打日志验证逻辑对不对——以后要接真车控，
+     * 这里换成对应的 carControl?.setAcTemperature(...) /
+     * setDriverSeatVentilating(...)（复用 onCommand 里 "ac.temperature" /
+     * "seat.ventilating" 已有的分支逻辑）。
+     */
+    private fun applyCurrent() {
+        val desc = if (currentModule == 0) "ac.temperature value=$currentValue"
+                   else "seat.ventilating state=$currentValue"
+        host?.log("🚗（模拟）应用车控：$desc —— 未真正调用 CarControl，先在手机上验证逻辑")
     }
 
     // ==================== 页面栈（纯代码构建 View，避免资源 ID 冲突） ====================

@@ -7,14 +7,14 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.os.Handler
-import android.os.Looper
 import android.provider.MediaStore
 import android.provider.Settings
 import android.view.KeyEvent
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import cn.icarus.knob.ble.BleManager
 import cn.icarus.knob.databinding.ActivityKnobBinding
 import cn.icarus.knob.host.KnobHostImpl
 import cn.icarus.knob.plugin.PluginLoader
@@ -36,6 +36,7 @@ class KnobActivity : AppCompatActivity() {
     private lateinit var binding: ActivityKnobBinding
 
     private val REQUEST_BYDAUTO_PERM = 2001
+    private val REQUEST_BLUETOOTH_PERM = 2002
 
     // 文件选择器：选择 plugin.dex（SAF，无需存储权限）
     private val pickPluginLauncher =
@@ -51,6 +52,10 @@ class KnobActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityKnobBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        // 屏幕常亮：靠旋钮操作，不是触屏，不加这个的话没有触摸事件会
+        // 正常走到系统的自动息屏/锁屏。
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         // 安装全局崩溃捕获器（崩溃时导出 crash_*.txt 到 Downloads）
         CrashHandler.install()
@@ -70,14 +75,34 @@ class KnobActivity : AppCompatActivity() {
         }
         binding.btnClearLog.setOnClickListener { LogSink.clear() }
         binding.btnSaveLog.setOnClickListener { saveLog() }
+        binding.btnTestBleWrite.setOnClickListener {
+            // 万一之前 init() 时设备还没配对，这里顺手再触发一次
+            // （已经连上的话 init() 内部会直接跳过，不会有副作用）。
+            BleManager.init(applicationContext)
+            val sent = BleManager.write(0, 22)
+            LogSink.append(if (sent) "[测试] BleManager.write(0, 22) 已发送" else "[测试] BleManager.write(0, 22) 失败（GATT 未就绪）")
+        }
 
         // 插件已在 Application.onCreate 同步加载完，这里把页面容器交给它
         bindPluginUi()
+    }
 
-        // 首次启动自动申请 BYDAUTO 运行时权限（延迟等界面就绪）
-        Handler(Looper.getMainLooper()).postDelayed({
-            requestBydPermissions()
-        }, 600)
+    /**
+     * 权限申请放在 onResume() 而不是 onCreate() 的固定延时里：
+     * logAccessibilityStatus() 发现无障碍没开时会跳去系统设置页
+     * （startActivity），这时候 Activity 已经不在前台了，如果这时候再用
+     * 一个跟这个事件无关的定时器去弹权限对话框，很可能弹不出来或者被
+     * 判成拒绝。onResume() 每次真正回到前台（包括从设置页返回）都会
+     * 触发，才是弹权限对话框安全的时机。
+     *
+     * 这里只发起 BYDAUTO 那一批——蓝牙权限的申请挪到它的结果回调里
+     * 串行触发（见 onRequestPermissionsResult）。同一个 Activity 同时
+     * 只能有一个 requestPermissions() 在飞，紧挨着连续调用两次，第二个
+     * 很可能被系统直接吞掉、根本不会弹出来。
+     */
+    override fun onResume() {
+        super.onResume()
+        requestBydPermissions()
     }
 
     /** 若插件已加载，把右半边容器交给插件，让插件渲染页面 */
@@ -273,14 +298,50 @@ class KnobActivity : AppCompatActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != REQUEST_BYDAUTO_PERM) return
-        LogSink.section("权限申请结果")
-        permissions.forEachIndexed { index, perm ->
-            val granted = index < grantResults.size &&
-                grantResults[index] == PackageManager.PERMISSION_GRANTED
-            val shortName = perm.removePrefix("android.permission.")
-            LogSink.append(if (granted) "✅ $shortName 已授权" else "❌ $shortName 未授权")
+        when (requestCode) {
+            REQUEST_BYDAUTO_PERM -> {
+                LogSink.section("权限申请结果")
+                permissions.forEachIndexed { index, perm ->
+                    val granted = index < grantResults.size &&
+                        grantResults[index] == PackageManager.PERMISSION_GRANTED
+                    val shortName = perm.removePrefix("android.permission.")
+                    LogSink.append(if (granted) "✅ $shortName 已授权" else "❌ $shortName 未授权")
+                }
+                LogSink.append("→ GET/SET 为签名级权限，需 BYD 签名后由系统授予")
+                // BYDAUTO 这批的结果回来了，才轮到蓝牙那个请求——不能跟
+                // 上面这批同时发起，见 onResume() 的注释。
+                requestBluetoothPermissionAndConnect()
+            }
+            REQUEST_BLUETOOTH_PERM -> {
+                val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                LogSink.append(if (granted) "✅ BLUETOOTH_CONNECT 已授权" else "❌ BLUETOOTH_CONNECT 未授权，BLE 写入功能不可用")
+                if (granted) BleManager.init(applicationContext)
+            }
         }
-        LogSink.append("→ GET/SET 为签名级权限，需 BYD 签名后由系统授予")
+    }
+
+    // ==================== 蓝牙权限 + GATT 连接 ====================
+
+    /**
+     * BLUETOOTH_CONNECT 是 API 31+ 才有的运行时权限，更早的系统靠
+     * manifest 里 maxSdkVersion=30 的旧版 BLUETOOTH/BLUETOOTH_ADMIN
+     * （安装时自动授予，不用申请）覆盖，直接连。
+     */
+    private fun requestBluetoothPermissionAndConnect() {
+        LogSink.section("蓝牙权限 / GATT 连接")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            LogSink.append("当前系统无需运行时申请蓝牙权限（API < 31）")
+            BleManager.init(applicationContext)
+            return
+        }
+        val granted = checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
+            PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            LogSink.append("✅ BLUETOOTH_CONNECT 已授权")
+            BleManager.init(applicationContext)
+        } else {
+            LogSink.append("请求 BLUETOOTH_CONNECT 权限")
+            requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT), REQUEST_BLUETOOTH_PERM)
+        }
     }
 }
