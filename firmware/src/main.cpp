@@ -123,12 +123,13 @@ void loop() {
 
     int16_t diff = encoder_get_diff();
     if (diff != 0 && ble_is_paired()) {
-        // 快转一下可能一次性攒了好几档（见 encoder_get_diff 的说明），
-        // 这里按实际档数补发对应次数的方向键，不是只发一下。
+        // 快转一下可能一次性攒了好几档（见 encoder_get_diff 的说明）。
+        // 一条通知里带上这次的总档数，不要按档数循环发好几条——BLE
+        // 连接每个间隔基本只能发一个通知包，逐条发的话转得越快排队
+        // 延迟越大；打包成一条之后不管转了多少档都只占一次连接间隔。
         int16_t key = diff > 0 ? KEYCODE_DPAD_RIGHT : KEYCODE_DPAD_LEFT;
-        for (int16_t i = 0; i < abs(diff); i++) {
-            ble_send_key(key);
-        }
+        uint8_t repeat = (uint8_t)(abs(diff) > 255 ? 255 : abs(diff));
+        ble_send_key(key, repeat);
         Serial.printf("[ENC] diff=%d\n", diff);
     }
 

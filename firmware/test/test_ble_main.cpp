@@ -11,8 +11,12 @@
 // 验证按键事件通知（29afa70d-... 服务下 182f303d-... 特征值）：在
 // nRF Connect 里对这个特征值点"订阅"（Enable Notifications），连上后
 // 每隔 2 秒会交替通知一次左/右方向键，应该能在 nRF Connect 里看到收到
-// 的 2 字节数据交替变化（21,0 / 22,0，小端 int16 的 KEYCODE_DPAD_LEFT/
-// RIGHT），串口也会打印发送日志。
+// 的 8 字节数据交替变化：
+//   01 00 15 00 02 00 01 00  （KEYCODE_DPAD_LEFT=21, repeat=1）
+//   01 00 16 00 02 00 01 00  （KEYCODE_DPAD_RIGHT=22, repeat=1）
+// 每 4 字节一个字段：fieldId(1) + type(1)=0(int16) + value(2,小端)。
+// 第一个字段 fieldId=1=KEY_FIELD_CODE，第二个 fieldId=2=KEY_FIELD_REPEAT。
+// 串口也会打印发送日志。
 //
 // 顺带验证 ble_on_display_update()：找到同一服务下的可写特征值
 // （5f774e59-...），写 9 字节 "05 76 61 6C 75 65 00 16 00"——这是通用

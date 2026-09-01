@@ -218,15 +218,26 @@ bool ble_is_paired() {
     return s_authenticated;
 }
 
-void ble_send_key(int16_t keycode) {
+// 把一个 int16 字段编码成 "fieldId(1) + type(1)=0 + value(2,小端)"，写进
+// buf，返回写入的字节数——跟 DisplayData 用的是同一套 type 约定（0=int16），
+// 只是用数字 ID 代替字段名文本，按键事件这条通道字节量更小。
+static size_t encode_int16_field(uint8_t *buf, uint8_t fieldId, int16_t value) {
+    buf[0] = fieldId;
+    buf[1] = 0; // type = int16
+    buf[2] = (uint8_t)(value & 0xFF);
+    buf[3] = (uint8_t)((value >> 8) & 0xFF);
+    return 4;
+}
+
+void ble_send_key(int16_t keycode, uint8_t repeat) {
     if (!ble_is_paired() || s_key_event_char == nullptr) {
         return;
     }
-    uint8_t payload[2] = {
-        (uint8_t)(keycode & 0xFF),
-        (uint8_t)((keycode >> 8) & 0xFF),
-    };
-    s_key_event_char->notify(payload, sizeof(payload));
+    uint8_t payload[8]; // 两个字段，各 4 字节
+    size_t pos = 0;
+    pos += encode_int16_field(payload + pos, KEY_FIELD_CODE, keycode);
+    pos += encode_int16_field(payload + pos, KEY_FIELD_REPEAT, (int16_t)repeat);
+    s_key_event_char->notify(payload, pos);
 }
 
 void ble_on_display_update(void (*callback)(const DisplayData &data)) {

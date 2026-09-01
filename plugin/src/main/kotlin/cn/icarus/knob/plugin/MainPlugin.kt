@@ -231,7 +231,15 @@ class MainPlugin : KnobPlugin {
                 "key" -> {
                     val code = (params["code"] as? Number)?.toInt() ?: return false
                     val action = (params["action"] as? Number)?.toInt() ?: return false
-                    handleKey(code, action)
+                    // repeat：旋钮快速转动一个 loop() 周期内攒的好几档，
+                    // 固件打包成一条通知发过来，这里要一次性按总档数调，
+                    // 不能按 1 处理——不然虽然 BLE 包数省了，手机这边还是
+                    // 会为每一档单独走一遍"调值+重建页面+同步给 knob"，
+                    // 一样会随转动速度堆积延迟。缺省 1 是给系统按键
+                    // （KnobActivity.dispatchKeyEvent 转发的车机物理键）用的，
+                    // 那些天然就是"按一下算一下"。
+                    val repeat = (params["repeat"] as? Number)?.toInt() ?: 1
+                    handleKey(code, action, repeat)
                 }
                 else -> false
             }
@@ -293,7 +301,7 @@ class MainPlugin : KnobPlugin {
      * 交给壳/系统默认处理。按下和抬起都要消费，只吃一半会让系统按键状态
      * 错乱。
      */
-    private fun handleKey(code: Int, action: Int): Boolean {
+    private fun handleKey(code: Int, action: Int, repeat: Int = 1): Boolean {
         when (code) {
             KeyEvent.KEYCODE_TAB -> {
                 if (action == KeyEvent.ACTION_UP) {
@@ -306,7 +314,12 @@ class MainPlugin : KnobPlugin {
             }
             KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
                 if (action == KeyEvent.ACTION_UP) {
-                    adjustPrimaryValue(if (code == KeyEvent.KEYCODE_DPAD_RIGHT) 1 else -1)
+                    // repeat 一次性乘进 delta 里，只调一次值、只重建一次
+                    // 页面、只同步一次给 knob——不按 repeat 次数循环调用，
+                    // 不然快速转动时这边照样会攒延迟，只是把延迟从 BLE
+                    // 包排队换成了本地重复计算。
+                    val delta = (if (code == KeyEvent.KEYCODE_DPAD_RIGHT) 1 else -1) * repeat
+                    adjustPrimaryValue(delta)
                 }
                 return true
             }

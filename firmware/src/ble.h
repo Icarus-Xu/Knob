@@ -26,9 +26,20 @@ void ble_init();
 // 这个，没配对时发了也没人收。
 bool ble_is_paired();
 
-// 通知手机"发生了一次按键"，keycode 用上面 KEYCODE_* 常量。没配对时
-// 调用不会有任何效果。
-void ble_send_key(int16_t keycode);
+// 按键事件通知的字段 ID——跟手机那边 BleManager.kt 里同名常量对齐（两边
+// 各写一份、数值对齐，就跟 KEYCODE_* 这些常量的维护方式一样）。用数字
+// ID 代替字段名文本，字节量比 DisplayData 那种"keyLen+key名"的编码小
+// 得多，这条通道每次转旋钮都要发，值得省这个字节。
+constexpr uint8_t KEY_FIELD_CODE = 1;
+constexpr uint8_t KEY_FIELD_REPEAT = 2;
+
+// 通知手机"发生了一次按键"，keycode 用上面 KEYCODE_* 常量，repeat 是
+// 这次一共要算几下（比如旋钮快速转动一个 loop() 周期内积累了好几档，
+// 一次性带上总档数，不要按档数循环调用多次）——快速转动时如果逐档发送，
+// 每档都要单独占一次 BLE 连接间隔才能发出去，攒起来的延迟会随转动速度
+// 线性增加；打包成一条通知之后，不管这次转了多少档都只占一次连接间隔。
+// 没配对时调用不会有任何效果。
+void ble_send_key(int16_t keycode, uint8_t repeat = 1);
 
 // 手机推来的显示数据，通用键值对——这一层（跟手机那边的插件对应）自己
 // 按约定好的 key 名取值，壳（BleManager/KnobHostImpl）完全不理解这些

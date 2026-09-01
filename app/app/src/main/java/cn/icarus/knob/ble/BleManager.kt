@@ -32,7 +32,16 @@ import java.util.UUID
  * 对应固件那边 firmware/src/ble.cpp 里的自定义服务：
  *   service UUID:              29afa70d-2312-4f04-9b36-fe9298284756
  *   按键事件特征值（NOTIFY）：   182f303d-ea98-4ee4-839e-5599aaf3f29d
- *     payload: 2 字节，小端 int16 = Android KeyEvent.KEYCODE_* 值
+ *     payload: 一串字段，每个 4 字节 = fieldId(1) + type(1，目前只有
+ *     0=int16) + value(2，小端)。fieldId 用 FIELD_CODE/FIELD_REPEAT
+ *     这两个数字常量代替字段名文本（跟固件 ble.h 的 KEY_FIELD_CODE/
+ *     KEY_FIELD_REPEAT 数值对齐），比 DisplayData 那种"keyLen+key名"的
+ *     编码省字节——这条通道每次转旋钮都要发，值得省。解码本身仍然是
+ *     顺序无关、字段可扩展的（新增字段不会破坏旧字段的解析），只是这里
+ *     解出来之后还是要按 FIELD_CODE/FIELD_REPEAT 取值传给
+ *     onEvent("key", {code, action, repeat})——那个接口本身的字段名是
+ *     插件契约的一部分（KnobPlugin.kt 里文档化的固定形状），不是这次
+ *     要通用化的目标，壳在"编解码 BLE 字节"这一层已经不用认字段名了。
  *   显示同步特征值（WRITE）：    5f774e59-5079-4e69-8e5d-de0ee1220d3f
  *     payload: 通用键值对编码，见 write(Map) / encodeDisplayData() 的
  *     注释——这里（跟固件 ble.cpp 对应）完全不理解字段含义，插件传什么
@@ -51,6 +60,10 @@ object BleManager {
     private val DISPLAY_CHARACTERISTIC_UUID = UUID.fromString("5f774e59-5079-4e69-8e5d-de0ee1220d3f")
     // 标准 BLE 描述符 UUID：Client Characteristic Configuration，订阅 NOTIFY 靠写这个。
     private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+    // 按键事件字段 ID，跟 firmware/src/ble.h 的 KEY_FIELD_CODE/KEY_FIELD_REPEAT 数值对齐。
+    private const val FIELD_CODE = 1
+    private const val FIELD_REPEAT = 2
 
     private var gatt: BluetoothGatt? = null
     private var displayCharacteristic: BluetoothGattCharacteristic? = null
@@ -281,26 +294,50 @@ object BleManager {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /**
-     * 收到一次按键通知：2 字节小端 int16 = Android KeyEvent.KEYCODE_*。
-     * 按下+抬起都转发给插件（跟以前无障碍服务转发系统按键时的语义一致，
-     * 只吃一半会让插件内部按键状态错乱），插件不处理时这里没有壳兜底可吃
-     * ——不再走系统按键分发，没有"焦点被移动/按钮被点击"这类风险了。
+     * 通用解码：一串 "fieldId(1) + type(1) + value" 字段，目前只认
+     * type=0（int16），遇到不认识的类型没法知道占几个字节，直接停止解析
+     * ——后面的字段宁可丢掉也不能瞎猜着继续读。顺序无关、缺字段/多字段
+     * 都不影响已解出来的部分，跟固件那边 parse_display_data() 是同一套
+     * 思路，只是 key 是数字 ID 不是字符串。
      */
-    private fun handleKeyEventNotification(value: ByteArray) {
-        if (value.size < 2) {
-            logBoth("按键通知长度不对（${value.size} 字节）", isWarning = true)
-            return
+    private fun decodeIntFields(value: ByteArray): Map<Int, Int> {
+        val result = mutableMapOf<Int, Int>()
+        var pos = 0
+        while (pos + 4 <= value.size) {
+            val fieldId = value[pos].toInt() and 0xFF
+            val type = value[pos + 1].toInt() and 0xFF
+            if (type != 0) break
+            val low = value[pos + 2].toInt() and 0xFF
+            val high = value[pos + 3].toInt() and 0xFF
+            result[fieldId] = (high shl 8) or low
+            pos += 4
         }
-        val low = value[0].toInt() and 0xFF
-        val high = value[1].toInt() and 0xFF
-        val code = (high shl 8) or low
-        logBoth("收到按键事件 code=$code")
-        mainHandler.post { dispatchKeyToPlugin(code) }
+        return result
     }
 
-    private fun dispatchKeyToPlugin(code: Int) {
-        PluginLoader.current?.onEvent("key", mapOf("code" to code, "action" to KeyEvent.ACTION_DOWN))
-        val consumed = PluginLoader.current?.onEvent("key", mapOf("code" to code, "action" to KeyEvent.ACTION_UP)) ?: false
+    /**
+     * 收到一次按键通知：解出 FIELD_CODE/FIELD_REPEAT 两个字段。按下+抬起
+     * 都转发给插件（跟以前无障碍服务转发系统按键时的语义一致，只吃一半
+     * 会让插件内部按键状态错乱），插件不处理时这里没有壳兜底可吃——不再
+     * 走系统按键分发，没有"焦点被移动/按钮被点击"这类风险了。
+     */
+    private fun handleKeyEventNotification(value: ByteArray) {
+        val fields = decodeIntFields(value)
+        val code = fields[FIELD_CODE] ?: run {
+            logBoth("按键通知缺 code 字段（${value.size} 字节）", isWarning = true)
+            return
+        }
+        val repeat = fields[FIELD_REPEAT] ?: 1
+        logBoth("收到按键事件 code=$code repeat=$repeat")
+        mainHandler.post { dispatchKeyToPlugin(code, repeat) }
+    }
+
+    private fun dispatchKeyToPlugin(code: Int, repeat: Int) {
+        PluginLoader.current?.onEvent("key", mapOf("code" to code, "action" to KeyEvent.ACTION_DOWN, "repeat" to repeat))
+        val consumed = PluginLoader.current?.onEvent(
+            "key",
+            mapOf("code" to code, "action" to KeyEvent.ACTION_UP, "repeat" to repeat)
+        ) ?: false
         logBoth(if (consumed) "  → 插件已处理" else "  → 插件未处理")
     }
 

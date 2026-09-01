@@ -48,10 +48,15 @@ interface KnobPlugin {
     /**
      * 事件域：外部事件。
      * @param event 事件名，约定：
-     *   "key"           params: {code: Int, action: Int}
+     *   "key"           params: {code: Int, action: Int, repeat: Int?}
      *                   壳转发的按键：蓝牙旋钮/按键（自定义 BLE GATT 通知，见 BleManager）、
      *                   车机物理键、系统返回键都走这里。
      *                   code = KeyEvent.KEYCODE_*，action = KeyEvent.ACTION_DOWN / ACTION_UP。
+     *                   repeat：这次一共算几下（旋钮快速转动时固件会把
+     *                   一个周期内攒的好几档打包成一条通知，不是逐档发），
+     *                   缺省按 1 处理——需要按 repeat 一次性应用总量，不要
+     *                   循环调用 repeat 次，否则快速转动时页面重建/knob
+     *                   同步照样会随速度堆积延迟。
      *                   消费某个键时**按下与抬起要成对返回 true**，只吃一半会让系统按键状态错乱。
      *   "ui.bind"       params: {container: ViewGroup} 壳把页面容器交给插件，插件开始渲染并自管页面栈
      *   "ui.unbind"     params: {}                     Activity 销毁，插件必须断开对该容器/View 树的持有
