@@ -40,7 +40,7 @@ class MainPlugin : KnobPlugin {
         private const val KEY_SEAT_LEVEL = "seat_level"
 
         // 座椅 5 档：-2/-1=通风2/1档，0=关闭，1/2=加热1/2档。负数=通风、
-        // 正数=加热，这样 DPAD 左右调整、knob 屏幕的"居中对称"圆弧
+        // 正数=加热，这样触屏 ±/knob 屏幕的"居中对称"圆弧
         // （见 firmware/src/main.cpp 的 LV_ARC_MODE_SYMMETRICAL）都能直接
         // 用这一个有符号数表示，不用另外维护"档位+方向"两个字段。
         // CarControl 里还没有座椅加热的真实 HAL 接口，这几个档位目前只在
@@ -231,15 +231,11 @@ class MainPlugin : KnobPlugin {
                 "key" -> {
                     val code = (params["code"] as? Number)?.toInt() ?: return false
                     val action = (params["action"] as? Number)?.toInt() ?: return false
-                    // repeat：旋钮快速转动一个 loop() 周期内攒的好几档，
-                    // 固件打包成一条通知发过来，这里要一次性按总档数调，
-                    // 不能按 1 处理——不然虽然 BLE 包数省了，手机这边还是
-                    // 会为每一档单独走一遍"调值+重建页面+同步给 knob"，
-                    // 一样会随转动速度堆积延迟。缺省 1 是给系统按键
-                    // （KnobActivity.dispatchKeyEvent 转发的车机物理键）用的，
-                    // 那些天然就是"按一下算一下"。
-                    val repeat = (params["repeat"] as? Number)?.toInt() ?: 1
-                    handleKey(code, action, repeat)
+                    // value：只有旋钮长按（确认）才会带上，是旋钮本地编辑
+                    // 到的最终值——旋钮转动时不再逐档通知手机，只有长按
+                    // 才把结果发过来。
+                    val value = (params["value"] as? Number)?.toInt()
+                    handleKey(code, action, value)
                 }
                 else -> false
             }
@@ -295,13 +291,15 @@ class MainPlugin : KnobPlugin {
     /**
      * 按键处理，返回是否消费。
      *
-     * 旋钮映射：Tab=切换页面（车控页/座椅页循环），DPAD Left/Right=调整
-     * 当前页面的主要数值，Enter=应用（对应触屏页面上的 OK）。系统返回键
-     * 不再有特殊处理——页面之间是平级切换，没有"返回上一页"这个概念了，
-     * 交给壳/系统默认处理。按下和抬起都要消费，只吃一半会让系统按键状态
+     * 旋钮映射：Tab=切换页面（车控页/座椅页循环），Enter=确认（对应触屏
+     * 页面上的 OK）。旋钮转动本身完全在固件本地处理、不再上报给手机——
+     * 长按 Enter 时才把旋钮本地编辑到的最终值（value）一起带过来，直接
+     * 拿去应用，不需要手机在转动过程中跟着增量调整。系统返回键不再有
+     * 特殊处理——页面之间是平级切换，没有"返回上一页"这个概念了，交给
+     * 壳/系统默认处理。按下和抬起都要消费，只吃一半会让系统按键状态
      * 错乱。
      */
-    private fun handleKey(code: Int, action: Int, repeat: Int = 1): Boolean {
+    private fun handleKey(code: Int, action: Int, value: Int?): Boolean {
         when (code) {
             KeyEvent.KEYCODE_TAB -> {
                 if (action == KeyEvent.ACTION_UP) {
@@ -312,19 +310,8 @@ class MainPlugin : KnobPlugin {
                 }
                 return true
             }
-            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                if (action == KeyEvent.ACTION_UP) {
-                    // repeat 一次性乘进 delta 里，只调一次值、只重建一次
-                    // 页面、只同步一次给 knob——不按 repeat 次数循环调用，
-                    // 不然快速转动时这边照样会攒延迟，只是把延迟从 BLE
-                    // 包排队换成了本地重复计算。
-                    val delta = (if (code == KeyEvent.KEYCODE_DPAD_RIGHT) 1 else -1) * repeat
-                    adjustPrimaryValue(delta)
-                }
-                return true
-            }
             KeyEvent.KEYCODE_ENTER -> {
-                if (action == KeyEvent.ACTION_UP) applyPrimaryValue()
+                if (action == KeyEvent.ACTION_UP) applyPrimaryValue(value)
                 return true
             }
         }
@@ -333,46 +320,38 @@ class MainPlugin : KnobPlugin {
     }
 
     /**
-     * DPAD 调整当前页面的"主要数值"。空调页分控开启时固定调主驾温度
-     * （旋钮是驾驶员的物理控件，副驾那组只能触屏调）；分控关闭时调联动
-     * 温度。座椅页调 seatLevel（-2~2，负=通风、正=加热）。
+     * Enter：应用当前页面的主要数值，等价于触屏上点那一行的 OK。
+     * @param knobValue 旋钮本地编辑到的最终值（长按时固件带过来的），
+     *   写入 vehicleState 后再提交——旋钮转动期间手机完全不知道中间值，
+     *   只在这一下才知道最终结果。knobValue 为 null（比如系统按键触发
+     *   的 Enter，没有旋钮本地状态）时直接沿用 vehicleState 里已有的值。
      */
-    private fun adjustPrimaryValue(delta: Int) {
+    private fun applyPrimaryValue(knobValue: Int?) {
         when (currentPageId) {
             "car" -> {
                 if (vehicleState.acSeparate) {
-                    vehicleState.acMainTemp = (vehicleState.acMainTemp + delta)
-                        .coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+                    if (knobValue != null) {
+                        vehicleState.acMainTemp = knobValue.coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+                    }
+                    persistState()
+                    commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN, vehicleState.acMainTemp)
                 } else {
-                    vehicleState.acMainDeputyTemp = (vehicleState.acMainDeputyTemp + delta)
-                        .coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+                    if (knobValue != null) {
+                        vehicleState.acMainDeputyTemp = knobValue.coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+                    }
+                    persistState()
+                    commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN_DEPUTY, vehicleState.acMainDeputyTemp)
                 }
-                host?.log("🎚 DPAD -> ${if (vehicleState.acSeparate) "主驾" else "联动"}温度=" +
-                    "${if (vehicleState.acSeparate) vehicleState.acMainTemp else vehicleState.acMainDeputyTemp}")
-                persistState()
                 refreshCurrentPage()
             }
             "seat" -> {
-                vehicleState.seatLevel = (vehicleState.seatLevel + delta).coerceIn(SEAT_LEVEL_MIN, SEAT_LEVEL_MAX)
-                host?.log("🎚 DPAD -> 座椅 ${seatLevelLabel(vehicleState.seatLevel)}")
+                if (knobValue != null) {
+                    vehicleState.seatLevel = knobValue.coerceIn(SEAT_LEVEL_MIN, SEAT_LEVEL_MAX)
+                }
                 persistState()
+                commitSeatLevel(vehicleState.seatLevel)
                 refreshCurrentPage()
             }
-            else -> Unit
-        }
-    }
-
-    /** Enter：应用当前页面的主要数值，等价于触屏上点那一行的 OK。 */
-    private fun applyPrimaryValue() {
-        when (currentPageId) {
-            "car" -> {
-                if (vehicleState.acSeparate) {
-                    commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN, vehicleState.acMainTemp)
-                } else {
-                    commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN_DEPUTY, vehicleState.acMainDeputyTemp)
-                }
-            }
-            "seat" -> commitSeatLevel(vehicleState.seatLevel)
             else -> Unit
         }
     }
@@ -396,12 +375,13 @@ class MainPlugin : KnobPlugin {
     }
 
     /**
-     * 把当前页面的"主要数值"同步给旋钮屏幕（走 host.pushToKnob -> BLE -> ESP32）。
-     * knob 自己不知道页面/模块的概念，只管按拿到的 title/value/min/max
-     * 原样显示——跟 DPAD/Enter 实际操作的是同一个值（空调页分控开时是
-     * 主驾温度，关时是联动温度；座椅页是 seatLevel），保证屏幕显示的
-     * 永远是旋钮当前能调的那个数。min<0（座椅）时固件会画成从中间向
-     * 两侧扩展的圆弧，见 firmware/src/main.cpp。
+     * 把当前页面的"主要数值"同步给旋钮屏幕（走 host.pushToKnob -> BLE -> ESP32），
+     * 作为固件本地编辑的起点。knob 自己不知道页面/模块的概念，只管按
+     * 拿到的 title/value/min/max 原样显示；此后转动旋钮只改固件本地的
+     * 副本，不会再触发这个同步，直到长按确认把最终值带回来、或者切页面/
+     * 重新进页面时再推一次新的起点（空调页分控开时是主驾温度，关时是
+     * 联动温度；座椅页是 seatLevel）。min<0（座椅）时固件会画成从中间
+     * 向两侧扩展的圆弧，见 firmware/src/main.cpp。
      */
     private fun syncToKnob() {
         val (title, value, min, max) = when (currentPageId) {

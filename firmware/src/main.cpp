@@ -1,8 +1,10 @@
 // Knob 固件。
-// 屏幕完全由手机推来的数据驱动（标题/数值/取值范围），固件自己不存
-// "当前是哪个功能、合法范围是多少"这些状态——旋钮只负责发按键事件
-// （转动→左右方向键，单击→Tab，长按→Enter，不走标准 HID 键盘 profile，
-// 见 ble.h 顶部注释），屏幕内容由插件那边处理完按键后异步推回来更新。
+// 屏幕显示"当前正在编辑的一路数值"（标题/数值/取值范围），手机每次
+// 进页面/切页面时推一份新的过来当起点；转动旋钮只改本地这份副本、
+// 立刻重绘，不再每转一档就等手机一次——避免了转动和屏幕更新之间的
+// 蓝牙往返延迟。单击（Tab）切页面，长按（Enter）才把编辑到的最终值
+// 带给手机去真正应用（对应插件那边只有 Enter 会调用车控接口，DPAD
+// 调整期间不会触发大量真实车控调用）。
 // 方案见 docs/旋钮-最小硬件调试方案.md、docs/蓝牙控制配件-方案.md。
 
 #include <Arduino.h>
@@ -12,10 +14,18 @@
 #include "ble.h"
 
 // 后面需要更新的 LVGL 控件都存成全局变量，这样 build_ui()
-// （只创建一次）和 on_display_update()（手机推数据来时更新）才都能访问到。
+// （只创建一次）和 redraw()（数值变化时更新）才都能访问到。
 static lv_obj_t *s_label_name;
 static lv_obj_t *s_label_value;
 static lv_obj_t *s_arc;
+
+// 当前正在编辑的这一路数值——手机每次同步（进页面/切页面/长按确认后
+// 的回执）会覆盖这几个字段；转动旋钮只改 s_value 这一个字段，不碰
+// title/min/max，也不会发消息给手机。
+static char s_title[DisplayData::MAX_STR_LEN + 1] = "";
+static int16_t s_value = 0;
+static int16_t s_min = 0;
+static int16_t s_max = 0;
 
 // 浅蓝 -> 深蓝 -> 橙色 -> 红色，四段色标均匀分布在 [min,max] 上，两个
 // 页面共用同一套渐变：
@@ -23,8 +33,8 @@ static lv_obj_t *s_arc;
 //   深蓝到橙色的过渡。
 //   座椅（min<0，比如 -2~2，0=关闭居中）：通风那一侧落在浅蓝/深蓝这
 //   两段，加热那一侧落在橙/红这两段，"关闭"正好卡在深蓝到橙色的过渡
-//   区——但那时候指示条长度是 0（见 on_display_update 的对称模式），
-//   这段颜色根本不会被画出来，不影响观感。
+//   区——但那时候指示条长度是 0（见 redraw 的对称模式），这段颜色
+//   根本不会被画出来，不影响观感。
 static lv_color_t gradient_color(int16_t value, int16_t vmin, int16_t vmax) {
     static const lv_color_t stops[4] = {
         LV_COLOR_MAKE(0x64, 0xB5, 0xF6), // 浅蓝
@@ -45,34 +55,43 @@ static lv_color_t gradient_color(int16_t value, int16_t vmin, int16_t vmax) {
     return lv_color_mix(stops[idx + 1], stops[idx], (uint8_t)(frac * 255));
 }
 
-// 手机同步了新的显示数据时调用（见 ble_on_display_update）。这里认的
-// "title"/"value"/"min"/"max" 几个 key 是跟插件那边约定好的，壳不参与
-// 这部分——以后要加新字段/新形状的页面，只需要同时改插件发什么 key、
-// 这里认哪些 key，不用碰壳。data 指向的缓冲区只在本次回调期间有效，
-// getString() 拿到的指针也是，LVGL 的 lv_label_set_text 内部会自己
-// 复制一份文本，不需要额外处理。
-static void on_display_update(const DisplayData &data) {
-    lv_label_set_text(s_label_name, data.getString("title"));
-
-    int16_t value = data.getInt("value");
-    int16_t vmin = data.getInt("min");
-    int16_t vmax = data.getInt("max");
+// 用 s_title/s_value/s_min/s_max 当前的值重绘屏幕——转旋钮（本地改
+// s_value）和收到手机同步（改全部四个字段）之后都调这个，两条路径
+// 最终画出来的东西是一样的。
+static void redraw() {
+    lv_label_set_text(s_label_name, s_title);
 
     char buf[16];
-    snprintf(buf, sizeof(buf), "%d", value);
+    snprintf(buf, sizeof(buf), "%d", s_value);
     lv_label_set_text(s_label_value, buf);
 
-    if (vmax > vmin) {
-        lv_arc_set_range(s_arc, vmin, vmax);
+    if (s_max > s_min) {
+        lv_arc_set_range(s_arc, s_min, s_max);
         // min<0（比如座椅 -2~2，0=关闭居中）用 LVGL 内置的对称模式：
         // 指示条从取值范围的中点（这里正好是 0）往两侧长，负值往一侧、
         // 正值往另一侧——不用自己算角度，LVGL 按 range 中点自动处理。
         // 其它情况（比如空调温度 17~33，没有"居中关闭"这个概念）还是
         // 普通模式，从一端往另一端长。
-        lv_arc_set_mode(s_arc, vmin < 0 ? LV_ARC_MODE_SYMMETRICAL : LV_ARC_MODE_NORMAL);
-        lv_arc_set_value(s_arc, value);
+        lv_arc_set_mode(s_arc, s_min < 0 ? LV_ARC_MODE_SYMMETRICAL : LV_ARC_MODE_NORMAL);
+        lv_arc_set_value(s_arc, s_value);
     }
-    lv_obj_set_style_arc_color(s_arc, gradient_color(value, vmin, vmax), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_arc, gradient_color(s_value, s_min, s_max), LV_PART_INDICATOR);
+}
+
+// 手机同步了新的显示数据时调用（见 ble_on_display_update）——进页面、
+// 切页面（Tab）、长按确认后手机的回执，都会走到这里，覆盖本地这份
+// 编辑副本。这里认的 "title"/"value"/"min"/"max" 几个 key 是跟插件那边
+// 约定好的，壳不参与这部分——以后要加新字段/新形状的页面，只需要同时
+// 改插件发什么 key、这里认哪些 key，不用碰壳。data 指向的缓冲区只在
+// 本次回调期间有效，getString() 拿到的指针也是，用完这次回调就失效，
+// 所以这里立刻复制进 s_title，不能只存指针。
+static void on_display_update(const DisplayData &data) {
+    strncpy(s_title, data.getString("title"), sizeof(s_title) - 1);
+    s_title[sizeof(s_title) - 1] = '\0';
+    s_value = data.getInt("value");
+    s_min = data.getInt("min");
+    s_max = data.getInt("max");
+    redraw();
 }
 
 // 创建所有控件，只在 setup() 里调用一次。
@@ -113,7 +132,7 @@ void setup() {
     ble_on_display_update(on_display_update);
     ble_init();
 
-    Serial.println("[Knob] ready: rotate/click/long-press send key events, screen follows phone");
+    Serial.println("[Knob] ready: rotate = local edit, click = switch page, long-press = confirm");
 }
 
 void loop() {
@@ -122,15 +141,17 @@ void loop() {
     encoder_poll_button();
 
     int16_t diff = encoder_get_diff();
-    if (diff != 0 && ble_is_paired()) {
-        // 快转一下可能一次性攒了好几档（见 encoder_get_diff 的说明）。
-        // 一条通知里带上这次的总档数，不要按档数循环发好几条——BLE
-        // 连接每个间隔基本只能发一个通知包，逐条发的话转得越快排队
-        // 延迟越大；打包成一条之后不管转了多少档都只占一次连接间隔。
-        int16_t key = diff > 0 ? KEYCODE_DPAD_RIGHT : KEYCODE_DPAD_LEFT;
-        uint8_t repeat = (uint8_t)(abs(diff) > 255 ? 255 : abs(diff));
-        ble_send_key(key, repeat);
-        Serial.printf("[ENC] diff=%d\n", diff);
+    if (diff != 0) {
+        // 只改本地这份编辑副本、立刻重绘——不通知手机，转动过程中不会
+        // 有蓝牙往返，也就没有转动和屏幕更新之间的延迟。s_min/s_max
+        // 是手机上次同步时给的范围，本地直接夹住，不需要手机来回确认。
+        s_value = (int16_t)(s_value + diff);
+        if (s_max > s_min) {
+            if (s_value < s_min) s_value = s_min;
+            if (s_value > s_max) s_value = s_max;
+        }
+        redraw();
+        Serial.printf("[ENC] local value=%d\n", s_value);
     }
 
     if (encoder_take_click() && ble_is_paired()) {
@@ -139,8 +160,11 @@ void loop() {
     }
 
     if (encoder_take_long_press() && ble_is_paired()) {
-        Serial.println("[BTN] long-press -> ENTER");
-        ble_send_key(KEYCODE_ENTER);
+        // 长按 = 确认：把本地编辑到的最终值带给手机，插件收到后才会
+        // 真正调用车控接口——转动过程中不会触发任何车控调用，只有这
+        // 一下会。
+        Serial.printf("[BTN] long-press -> ENTER, value=%d\n", s_value);
+        ble_send_key_with_value(KEYCODE_ENTER, s_value);
     }
 
     display_task_handler(); // 让 LVGL 把刚才的改动画出来

@@ -33,15 +33,18 @@ import java.util.UUID
  *   service UUID:              29afa70d-2312-4f04-9b36-fe9298284756
  *   按键事件特征值（NOTIFY）：   182f303d-ea98-4ee4-839e-5599aaf3f29d
  *     payload: 一串字段，每个 4 字节 = fieldId(1) + type(1，目前只有
- *     0=int16) + value(2，小端)。fieldId 用 FIELD_CODE/FIELD_REPEAT
+ *     0=int16) + value(2，小端)。fieldId 用 FIELD_CODE/FIELD_VALUE
  *     这两个数字常量代替字段名文本（跟固件 ble.h 的 KEY_FIELD_CODE/
- *     KEY_FIELD_REPEAT 数值对齐），比 DisplayData 那种"keyLen+key名"的
+ *     KEY_FIELD_VALUE 数值对齐），比 DisplayData 那种"keyLen+key名"的
  *     编码省字节——这条通道每次转旋钮都要发，值得省。解码本身仍然是
  *     顺序无关、字段可扩展的（新增字段不会破坏旧字段的解析），只是这里
- *     解出来之后还是要按 FIELD_CODE/FIELD_REPEAT 取值传给
- *     onEvent("key", {code, action, repeat})——那个接口本身的字段名是
+ *     解出来之后还是要按 FIELD_CODE/FIELD_VALUE 取值传给
+ *     onEvent("key", {code, action, value})——那个接口本身的字段名是
  *     插件契约的一部分（KnobPlugin.kt 里文档化的固定形状），不是这次
  *     要通用化的目标，壳在"编解码 BLE 字节"这一层已经不用认字段名了。
+ *     value 字段现在只有长按（确认）才会带上——旋钮转动时只改本地
+ *     状态，不再逐档发按键，所以 DPAD 类型的按键事件已经不存在了，
+ *     Tab（切页面）也没有 value。
  *   显示同步特征值（WRITE）：    5f774e59-5079-4e69-8e5d-de0ee1220d3f
  *     payload: 通用键值对编码，见 write(Map) / encodeDisplayData() 的
  *     注释——这里（跟固件 ble.cpp 对应）完全不理解字段含义，插件传什么
@@ -61,9 +64,9 @@ object BleManager {
     // 标准 BLE 描述符 UUID：Client Characteristic Configuration，订阅 NOTIFY 靠写这个。
     private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-    // 按键事件字段 ID，跟 firmware/src/ble.h 的 KEY_FIELD_CODE/KEY_FIELD_REPEAT 数值对齐。
+    // 按键事件字段 ID，跟 firmware/src/ble.h 的 KEY_FIELD_CODE/KEY_FIELD_VALUE 数值对齐。
     private const val FIELD_CODE = 1
-    private const val FIELD_REPEAT = 2
+    private const val FIELD_VALUE = 2
 
     private var gatt: BluetoothGatt? = null
     private var displayCharacteristic: BluetoothGattCharacteristic? = null
@@ -309,17 +312,21 @@ object BleManager {
             if (type != 0) break
             val low = value[pos + 2].toInt() and 0xFF
             val high = value[pos + 3].toInt() and 0xFF
-            result[fieldId] = (high shl 8) or low
+            // 固件编码的是有符号 int16（小端），这里先拼成 16 位再转 Short
+            // 做符号扩展——直接 (high shl 8) or low 会把负数当成无符号
+            // 16 位数，比如座椅档位 -2（0xFFFE）会被解成 65534。
+            result[fieldId] = ((high shl 8) or low).toShort().toInt()
             pos += 4
         }
         return result
     }
 
     /**
-     * 收到一次按键通知：解出 FIELD_CODE/FIELD_REPEAT 两个字段。按下+抬起
-     * 都转发给插件（跟以前无障碍服务转发系统按键时的语义一致，只吃一半
-     * 会让插件内部按键状态错乱），插件不处理时这里没有壳兜底可吃——不再
-     * 走系统按键分发，没有"焦点被移动/按钮被点击"这类风险了。
+     * 收到一次按键通知：解出 FIELD_CODE 字段（必有）和 FIELD_VALUE 字段
+     * （只有长按确认才会带，其余按键没有）。按下+抬起都转发给插件（跟
+     * 以前无障碍服务转发系统按键时的语义一致，只吃一半会让插件内部按键
+     * 状态错乱），插件不处理时这里没有壳兜底可吃——不再走系统按键分发，
+     * 没有"焦点被移动/按钮被点击"这类风险了。
      */
     private fun handleKeyEventNotification(value: ByteArray) {
         val fields = decodeIntFields(value)
@@ -327,17 +334,18 @@ object BleManager {
             logBoth("按键通知缺 code 字段（${value.size} 字节）", isWarning = true)
             return
         }
-        val repeat = fields[FIELD_REPEAT] ?: 1
-        logBoth("收到按键事件 code=$code repeat=$repeat")
-        mainHandler.post { dispatchKeyToPlugin(code, repeat) }
+        val knobValue = fields[FIELD_VALUE]
+        logBoth("收到按键事件 code=$code value=$knobValue")
+        mainHandler.post { dispatchKeyToPlugin(code, knobValue) }
     }
 
-    private fun dispatchKeyToPlugin(code: Int, repeat: Int) {
-        PluginLoader.current?.onEvent("key", mapOf("code" to code, "action" to KeyEvent.ACTION_DOWN, "repeat" to repeat))
-        val consumed = PluginLoader.current?.onEvent(
-            "key",
-            mapOf("code" to code, "action" to KeyEvent.ACTION_UP, "repeat" to repeat)
-        ) ?: false
+    private fun dispatchKeyToPlugin(code: Int, value: Int?) {
+        val params = { action: Int ->
+            if (value != null) mapOf("code" to code, "action" to action, "value" to value)
+            else mapOf("code" to code, "action" to action)
+        }
+        PluginLoader.current?.onEvent("key", params(KeyEvent.ACTION_DOWN))
+        val consumed = PluginLoader.current?.onEvent("key", params(KeyEvent.ACTION_UP)) ?: false
         logBoth(if (consumed) "  → 插件已处理" else "  → 插件未处理")
     }
 

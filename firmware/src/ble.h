@@ -3,12 +3,9 @@
 #include <stdint.h>
 
 // Android KeyEvent.KEYCODE_* 常量（不依赖 Android SDK，这几个数值是长期
-// 稳定不变的 AOSP 框架常量，直接抄过来用）。旋钮的每个动作都编码成
-// 这几个键之一通知给手机，含义跟以前 HID 键盘方案里左右方向键/Tab/
-// Enter 一一对应，只是现在直接传 Android 按键码，不用再经过 USB HID
-// keycode 转换。
-constexpr int16_t KEYCODE_DPAD_LEFT = 21;
-constexpr int16_t KEYCODE_DPAD_RIGHT = 22;
+// 稳定不变的 AOSP 框架常量，直接抄过来用）。DPAD 转动现在完全本地处理
+// （见 main.cpp），不再通知手机，所以这里只剩 Tab（单击=切页面）和
+// Enter（长按=确认，带上最终值）两个真正会发出去的键。
 constexpr int16_t KEYCODE_TAB = 61;
 constexpr int16_t KEYCODE_ENTER = 66;
 
@@ -29,17 +26,18 @@ bool ble_is_paired();
 // 按键事件通知的字段 ID——跟手机那边 BleManager.kt 里同名常量对齐（两边
 // 各写一份、数值对齐，就跟 KEYCODE_* 这些常量的维护方式一样）。用数字
 // ID 代替字段名文本，字节量比 DisplayData 那种"keyLen+key名"的编码小
-// 得多，这条通道每次转旋钮都要发，值得省这个字节。
+// 得多，这条通道每次按键都要发，值得省这个字节。
 constexpr uint8_t KEY_FIELD_CODE = 1;
-constexpr uint8_t KEY_FIELD_REPEAT = 2;
+constexpr uint8_t KEY_FIELD_VALUE = 2;
 
-// 通知手机"发生了一次按键"，keycode 用上面 KEYCODE_* 常量，repeat 是
-// 这次一共要算几下（比如旋钮快速转动一个 loop() 周期内积累了好几档，
-// 一次性带上总档数，不要按档数循环调用多次）——快速转动时如果逐档发送，
-// 每档都要单独占一次 BLE 连接间隔才能发出去，攒起来的延迟会随转动速度
-// 线性增加；打包成一条通知之后，不管这次转了多少档都只占一次连接间隔。
-// 没配对时调用不会有任何效果。
-void ble_send_key(int16_t keycode, uint8_t repeat = 1);
+// 通知手机"发生了一次按键"，keycode 用上面 KEYCODE_* 常量。没配对时
+// 调用不会有任何效果。
+void ble_send_key(int16_t keycode);
+
+// 跟 ble_send_key 一样，但额外带上一个数值——目前只有长按（确认）用，
+// 把旋钮本地编辑到的最终值一起带给手机，不用手机在这之前每转一档就
+// 跟着同步一遍。
+void ble_send_key_with_value(int16_t keycode, int16_t value);
 
 // 手机推来的显示数据，通用键值对——这一层（跟手机那边的插件对应）自己
 // 按约定好的 key 名取值，壳（BleManager/KnobHostImpl）完全不理解这些

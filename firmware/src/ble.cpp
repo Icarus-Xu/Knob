@@ -229,14 +229,23 @@ static size_t encode_int16_field(uint8_t *buf, uint8_t fieldId, int16_t value) {
     return 4;
 }
 
-void ble_send_key(int16_t keycode, uint8_t repeat) {
+void ble_send_key(int16_t keycode) {
+    if (!ble_is_paired() || s_key_event_char == nullptr) {
+        return;
+    }
+    uint8_t payload[4]; // 一个字段
+    size_t pos = encode_int16_field(payload, KEY_FIELD_CODE, keycode);
+    s_key_event_char->notify(payload, pos);
+}
+
+void ble_send_key_with_value(int16_t keycode, int16_t value) {
     if (!ble_is_paired() || s_key_event_char == nullptr) {
         return;
     }
     uint8_t payload[8]; // 两个字段，各 4 字节
     size_t pos = 0;
     pos += encode_int16_field(payload + pos, KEY_FIELD_CODE, keycode);
-    pos += encode_int16_field(payload + pos, KEY_FIELD_REPEAT, (int16_t)repeat);
+    pos += encode_int16_field(payload + pos, KEY_FIELD_VALUE, value);
     s_key_event_char->notify(payload, pos);
 }
 
