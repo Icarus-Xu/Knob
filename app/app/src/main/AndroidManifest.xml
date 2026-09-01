@@ -18,6 +18,9 @@
     <uses-permission android:name="android.permission.BYDAUTO_AC_COMMON" />
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
 
+    <!-- 开机自启：见 BootReceiver -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
     <application
         android:name=".KnobApp"
         android:allowBackup="true"
@@ -34,17 +37,16 @@
             </intent-filter>
         </activity>
 
-        <!-- 无障碍探测服务：捕获系统事件 + 读取当前窗口节点 -->
-        <service
-            android:name=".service.KnobAccessibilityService"
-            android:exported="false"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+        <!-- 开机自启：BOOT_COMPLETED 是标准 action，QUICKBOOT_POWERON 是部分
+             定制系统/车机的"快速开机"路径，两个都注册以覆盖车机实际走的路径 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="false">
             <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
-        </service>
+        </receiver>
+
     </application>
 </manifest>

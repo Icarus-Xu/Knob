@@ -120,6 +120,46 @@
             </LinearLayout>
         </LinearLayout>
 
+        <!-- 权限申请：每个权限单独一个按键，不在启动时自动弹——车机上
+             不知道自动弹权限会不会引发奇怪的系统行为，改成用户手动点。 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginTop="6dp">
+
+            <Button
+                android:id="@+id/btnReqAcCommon"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginEnd="2dp"
+                android:text="申请 AC_COMMON"
+                android:textSize="10sp"
+                android:textAllCaps="false" />
+
+            <Button
+                android:id="@+id/btnReqSettingCommon"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="2dp"
+                android:layout_marginEnd="2dp"
+                android:text="申请 SETTING_COMMON"
+                android:textSize="10sp"
+                android:textAllCaps="false" />
+
+            <Button
+                android:id="@+id/btnReqBluetooth"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="2dp"
+                android:text="申请蓝牙权限"
+                android:textSize="10sp"
+                android:textAllCaps="false" />
+        </LinearLayout>
+
         <!-- 临时调试按钮：验证 BleManager 能不能把数据写给 knob（第 2 步用，
              跑通后再决定要不要留） -->
         <Button
@@ -127,7 +167,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
-            android:text="🔧 测试 BLE 写入 (module=0 value=22)"
+            android:text="🔧 测试 BLE 写入 (标题/值/范围)"
             android:textSize="11sp"
             android:textAllCaps="false" />
     </LinearLayout>

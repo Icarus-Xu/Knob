@@ -12,8 +12,11 @@ import cn.icarus.knob.util.LogSink
  *
  * 同步而非延迟：Application.onCreate 必然早于本进程任何 Activity.onCreate，
  * 同步加载才能保证 KnobActivity 创建时插件已就绪、ui.bind 能命中。
- * 插件 dex 只有几十 KB，加载耗时可忽略；异常必须吞掉，
- * 否则会拖垮进程启动（无障碍服务也在同一进程，车机开机时靠它拉起本进程）。
+ * 插件 dex 只有几十 KB，加载耗时可忽略；异常必须吞掉，否则会拖垮进程启动。
+ *
+ * 注意：以前无障碍服务会在车机开机时把本进程拉起来，现在整个无障碍
+ * 服务都去掉了（改用自定义 BLE GATT 通道，见 BleManager），本进程没有
+ * 别的开机自启机制了——车机重启后需要手动点开一次 App 才会运行。
  */
 class KnobApp : Application() {
     override fun onCreate() {
