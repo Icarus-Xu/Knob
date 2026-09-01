@@ -25,12 +25,43 @@ import cn.icarus.knob.api.Ui
 class MainPlugin : KnobPlugin {
 
     companion object {
-        // module: 0=空调温度, 1=座椅通风。范围/默认值对应 CarControl 里
-        // 已验证过的真实 BYDAUTO 常量，不是编出来的数字。
-        private val MIN_VALUE = intArrayOf(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.SEAT_VENTILATING_OFF)
-        private val MAX_VALUE = intArrayOf(CarControl.AC_TEMP_CELSIUS_MAX, CarControl.SEAT_VENTILATING_HIGH)
-        private val DEFAULT_VALUE = intArrayOf(22, CarControl.SEAT_VENTILATING_OFF)
+        // 先不签名，验证按键/GATT/插件路由这条完整链路时不碰真实车控接口
+        // ——BYDAUTO_*_GET/SET 没有签名拿不到，调了也只会拿到失败/异常，
+        // 干扰链路验证。等签名装上真车机测试时把这个改成 false 就切回
+        // 真实调用，其余代码不用动。
+        private const val SIMULATE_CAR_CONTROL = true
+
+        private const val PREFS_NAME = "knob_plugin_state"
+        private const val KEY_PAGE = "page"
+        private const val KEY_AC_SEPARATE = "ac_separate"
+        private const val KEY_AC_MAIN_DEPUTY = "ac_main_deputy"
+        private const val KEY_AC_MAIN = "ac_main"
+        private const val KEY_AC_DEPUTY = "ac_deputy"
+        private const val KEY_SEAT_LEVEL = "seat_level"
+
+        // 座椅 5 档：-2/-1=通风2/1档，0=关闭，1/2=加热1/2档。负数=通风、
+        // 正数=加热，这样 DPAD 左右调整、knob 屏幕的"居中对称"圆弧
+        // （见 firmware/src/main.cpp 的 LV_ARC_MODE_SYMMETRICAL）都能直接
+        // 用这一个有符号数表示，不用另外维护"档位+方向"两个字段。
+        // CarControl 里还没有座椅加热的真实 HAL 接口，这几个档位目前只在
+        // 插件本地模拟，没有对应的真实车控常量可以复用。
+        private const val SEAT_LEVEL_MIN = -2
+        private const val SEAT_LEVEL_MAX = 2
     }
+
+    /**
+     * 车辆状态：插件内唯一数据源，触屏页面和旋钮同步都读写这一份，不再有
+     * 各自独立的状态。SIMULATE_CAR_CONTROL=true 时纯本地值；=false 时
+     * 由 loadAcState() 从 CarControl 真实读取覆盖（座椅暂时没有对应的真实
+     * 读取接口，始终是本地值）。
+     */
+    private data class VehicleState(
+        var acSeparate: Boolean = false,
+        var acMainDeputyTemp: Int = 22,
+        var acMainTemp: Int = 22,
+        var acDeputyTemp: Int = 22,
+        var seatLevel: Int = 0,
+    )
 
     private val tag = "KnobPlugin"
 
@@ -39,36 +70,23 @@ class MainPlugin : KnobPlugin {
     private var appContext: Context? = null
     private var host: KnobHost? = null
 
-    // ---- 页面栈（壳提供容器，插件自管多页面跳转）----
     private var pageContainer: ViewGroup? = null
-    private val pageStack = ArrayDeque<View>()
+    private val vehicleState = VehicleState()
 
-    // ---- 空调温度页状态（触屏"车控页"用，见 buildCarPage）----
-    // 分控开关的真实车况只在进页面时读一次（loadAcState），后续调整/OK都只
-    // 改这几个本地字段再重建页面，不追加读接口——写操作是否生效以返回码为准
-    // （CarControl 内部已经把返回码打进日志），不额外重新查一次确认。
-    private var acSeparate = false
-    private var acMainDeputyValue = 22
-    private var acMainValue = 22
-    private var acDeputyValue = 22
-
-    // ---- 旋钮当前控制的车控模块 + 数值（单一数据源，屏幕/日志都从这来）----
-    // 跟上面的空调温度页状态是两条独立的路径：这条是物理旋钮（Tab/DPAD/
-    // Enter）驱动、同步给 ESP32 屏幕用的，见 handleKey/syncToKnob。
-    // module: 0=空调温度(17-33°C), 1=座椅通风(1=关/2=低/3=高)
-    private var currentModule = 0
-    private var currentValue = DEFAULT_VALUE[0]
+    // 当前显示的页面 id，持久化 + 同步给 knob 屏幕。knobCyclePages 是旋钮
+    // 单击（Tab）能循环切到的页面，首页不算在内——旋钮场景下没有"回菜单"
+    // 的需求，首页只是触屏进入时的一个入口，靠页面里的按钮跳转。
+    private var currentPageId: String = "car"
+    private val knobCyclePages = listOf("car", "seat")
 
     override fun init(context: Context, host: KnobHost) {
         Log.i(tag, "MainPlugin.init 调用")
         appContext = context
         this.host = host
-        // 初始化车控引擎（日志转发给壳）
         carControl = CarControl(host)
         selfTest = PluginSelfTest(carControl!!, host)
         host.log("✅ 插件初始化完成（车控引擎已就绪）")
-        // 插件一加载就同步一次默认状态，不等"蓝牙已连接"这个信号——壳
-        // 目前也没有真的推送这个状态给插件，直接同步即可。
+        restoreState()
         syncToKnob()
     }
 
@@ -240,6 +258,10 @@ class MainPlugin : KnobPlugin {
                     ctrl?.log("📡 蓝牙状态: ${if (connected) "已连接" else "断开"} " +
                         "name=${data["name"]} mac=${data["mac"]}")
                     Log.i(tag, "onPush bluetooth connected=$connected")
+                    // 刚连上（含断线重连）时主动推一次当前状态给屏幕——不然
+                    // 插件 init() 那次同步大概率因为当时 GATT 还没连上而白白
+                    // 失败，用户不主动操作的话屏幕会一直停在出厂默认画面。
+                    if (connected) syncToKnob()
                 }
                 "state" -> {
                     ctrl?.log("ℹ️ 壳状态: ${data.map { "${it.key}=${it.value}" }.joinToString(", ")}")
@@ -265,38 +287,31 @@ class MainPlugin : KnobPlugin {
     /**
      * 按键处理，返回是否消费。
      *
-     * 返回键：页面栈里还有上一页时由插件吃掉（抬起时出栈），栈底则交还给壳去关闭 Activity。
-     * 旋钮映射：Tab=切换模块，DPAD Left/Right=调整当前模块的值，Enter=应用。
-     * 按下和抬起都要消费，只吃一半会让系统的按键状态错乱。
+     * 旋钮映射：Tab=切换页面（车控页/座椅页循环），DPAD Left/Right=调整
+     * 当前页面的主要数值，Enter=应用（对应触屏页面上的 OK）。系统返回键
+     * 不再有特殊处理——页面之间是平级切换，没有"返回上一页"这个概念了，
+     * 交给壳/系统默认处理。按下和抬起都要消费，只吃一半会让系统按键状态
+     * 错乱。
      */
     private fun handleKey(code: Int, action: Int): Boolean {
-        if (code == KeyEvent.KEYCODE_BACK) {
-            if (pageStack.size <= 1) return false
-            if (action == KeyEvent.ACTION_UP) popPage()
-            return true
-        }
         when (code) {
             KeyEvent.KEYCODE_TAB -> {
                 if (action == KeyEvent.ACTION_UP) {
-                    currentModule = 1 - currentModule
-                    currentValue = DEFAULT_VALUE[currentModule]
-                    host?.log("🔀 Tab -> module=$currentModule value=$currentValue")
-                    syncToKnob()
+                    val idx = knobCyclePages.indexOf(currentPageId)
+                    val next = knobCyclePages[if (idx == -1) 0 else (idx + 1) % knobCyclePages.size]
+                    host?.log("🔀 Tab -> $next")
+                    switchToPage(next)
                 }
                 return true
             }
             KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
                 if (action == KeyEvent.ACTION_UP) {
-                    val delta = if (code == KeyEvent.KEYCODE_DPAD_RIGHT) 1 else -1
-                    currentValue = (currentValue + delta)
-                        .coerceIn(MIN_VALUE[currentModule], MAX_VALUE[currentModule])
-                    host?.log("🎚 DPAD -> module=$currentModule value=$currentValue")
-                    syncToKnob()
+                    adjustPrimaryValue(if (code == KeyEvent.KEYCODE_DPAD_RIGHT) 1 else -1)
                 }
                 return true
             }
             KeyEvent.KEYCODE_ENTER -> {
-                if (action == KeyEvent.ACTION_UP) applyCurrent()
+                if (action == KeyEvent.ACTION_UP) applyPrimaryValue()
                 return true
             }
         }
@@ -304,118 +319,198 @@ class MainPlugin : KnobPlugin {
         return false
     }
 
-    /** 把当前模块+数值同步给旋钮屏幕（走 host.pushToKnob -> BLE -> ESP32）。 */
-    private fun syncToKnob() {
-        host?.pushToKnob(mapOf("module" to currentModule, "value" to currentValue))
-    }
-
     /**
-     * Enter：应用当前模块的数值。先不真的调用车控接口（在手机上测试阶段，
-     * 没有车、调了也没有意义），只打日志验证逻辑对不对——以后要接真车控，
-     * 这里换成对应的 carControl?.setAcTemperature(...) /
-     * setDriverSeatVentilating(...)（复用 onCommand 里 "ac.temperature" /
-     * "seat.ventilating" 已有的分支逻辑）。
+     * DPAD 调整当前页面的"主要数值"。空调页分控开启时固定调主驾温度
+     * （旋钮是驾驶员的物理控件，副驾那组只能触屏调）；分控关闭时调联动
+     * 温度。座椅页调 seatLevel（-2~2，负=通风、正=加热）。
      */
-    private fun applyCurrent() {
-        val desc = if (currentModule == 0) "ac.temperature value=$currentValue"
-                   else "seat.ventilating state=$currentValue"
-        host?.log("🚗（模拟）应用车控：$desc —— 未真正调用 CarControl，先在手机上验证逻辑")
-    }
-
-    // ==================== 页面栈（纯代码构建 View，避免资源 ID 冲突） ====================
-
-    /** 壳交出页面容器，插件开始渲染（自管页面栈） */
-    private fun bindUi(container: ViewGroup) {
-        pageContainer = container
-        Log.i(tag, "ui.bind: 页面容器已就绪")
-        // 首次进入显示首页；已有页面栈（Activity 重建）则恢复到离开时那一页
-        if (pageStack.isEmpty()) {
-            showPage("home")
-        } else {
-            renderTop()
+    private fun adjustPrimaryValue(delta: Int) {
+        when (currentPageId) {
+            "car" -> {
+                if (vehicleState.acSeparate) {
+                    vehicleState.acMainTemp = (vehicleState.acMainTemp + delta)
+                        .coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+                } else {
+                    vehicleState.acMainDeputyTemp = (vehicleState.acMainDeputyTemp + delta)
+                        .coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+                }
+                host?.log("🎚 DPAD -> ${if (vehicleState.acSeparate) "主驾" else "联动"}温度=" +
+                    "${if (vehicleState.acSeparate) vehicleState.acMainTemp else vehicleState.acMainDeputyTemp}")
+                persistState()
+                refreshCurrentPage()
+            }
+            "seat" -> {
+                vehicleState.seatLevel = (vehicleState.seatLevel + delta).coerceIn(SEAT_LEVEL_MIN, SEAT_LEVEL_MAX)
+                host?.log("🎚 DPAD -> 座椅 ${seatLevelLabel(vehicleState.seatLevel)}")
+                persistState()
+                refreshCurrentPage()
+            }
+            else -> Unit
         }
     }
 
+    /** Enter：应用当前页面的主要数值，等价于触屏上点那一行的 OK。 */
+    private fun applyPrimaryValue() {
+        when (currentPageId) {
+            "car" -> {
+                if (vehicleState.acSeparate) {
+                    commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN, vehicleState.acMainTemp)
+                } else {
+                    commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN_DEPUTY, vehicleState.acMainDeputyTemp)
+                }
+            }
+            "seat" -> commitSeatLevel(vehicleState.seatLevel)
+            else -> Unit
+        }
+    }
+
+    /** 座椅档位 -> 人能看懂的文字，UI 标签和日志都用这个，保证显示一致。 */
+    private fun seatLevelLabel(level: Int): String = when {
+        level <= -2 -> "通风2档"
+        level == -1 -> "通风1档"
+        level == 0 -> "关闭"
+        level == 1 -> "加热1档"
+        else -> "加热2档"
+    }
+
+    /** 座椅 OK 键：真正下发座椅通风/加热。CarControl 还没有真实的座椅加热接口，先只做模拟。 */
+    private fun commitSeatLevel(level: Int) {
+        if (SIMULATE_CAR_CONTROL) {
+            host?.log("🧪（模拟）座椅 -> ${seatLevelLabel(level)}")
+            return
+        }
+        host?.log("⚠️ 座椅真实车控接口还没实现（CarControl 缺座椅加热的 HAL 封装），只做了本地模拟：${seatLevelLabel(level)}")
+    }
+
     /**
-     * Activity 销毁，断开对容器和 View 树的持有。
-     * removeAllViews 会清掉栈顶 View 的 parent —— 既避免插件（常驻进程）泄漏已销毁的 Activity，
-     * 也让这些 View 下次 ui.bind 时能被重新 addView。pageStack 保留，以恢复页面位置。
+     * 把当前页面的"主要数值"同步给旋钮屏幕（走 host.pushToKnob -> BLE -> ESP32）。
+     * knob 自己不知道页面/模块的概念，只管按拿到的 title/value/min/max
+     * 原样显示——跟 DPAD/Enter 实际操作的是同一个值（空调页分控开时是
+     * 主驾温度，关时是联动温度；座椅页是 seatLevel），保证屏幕显示的
+     * 永远是旋钮当前能调的那个数。min<0（座椅）时固件会画成从中间向
+     * 两侧扩展的圆弧，见 firmware/src/main.cpp。
      */
+    private fun syncToKnob() {
+        val (title, value, min, max) = when (currentPageId) {
+            "car" -> if (vehicleState.acSeparate) {
+                DisplayInfo("空调温度(主驾)", vehicleState.acMainTemp, CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+            } else {
+                DisplayInfo("空调温度", vehicleState.acMainDeputyTemp, CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+            }
+            "seat" -> DisplayInfo(seatLevelLabel(vehicleState.seatLevel), vehicleState.seatLevel, SEAT_LEVEL_MIN, SEAT_LEVEL_MAX)
+            else -> DisplayInfo("首页", 0, 0, 0)
+        }
+        host?.pushToKnob(mapOf("title" to title, "value" to value, "min" to min, "max" to max))
+    }
+
+    private data class DisplayInfo(val title: String, val value: Int, val min: Int, val max: Int)
+
+    // ==================== 状态持久化（进程重启后恢复页面 + 车辆状态） ====================
+
+    private fun persistState() {
+        val ctx = appContext ?: return
+        ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putString(KEY_PAGE, currentPageId)
+            .putBoolean(KEY_AC_SEPARATE, vehicleState.acSeparate)
+            .putInt(KEY_AC_MAIN_DEPUTY, vehicleState.acMainDeputyTemp)
+            .putInt(KEY_AC_MAIN, vehicleState.acMainTemp)
+            .putInt(KEY_AC_DEPUTY, vehicleState.acDeputyTemp)
+            .putInt(KEY_SEAT_LEVEL, vehicleState.seatLevel)
+            .apply()
+    }
+
+    private fun restoreState() {
+        val ctx = appContext ?: return
+        val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        currentPageId = prefs.getString(KEY_PAGE, "car") ?: "car"
+        vehicleState.acSeparate = prefs.getBoolean(KEY_AC_SEPARATE, false)
+        vehicleState.acMainDeputyTemp = prefs.getInt(KEY_AC_MAIN_DEPUTY, 22)
+        vehicleState.acMainTemp = prefs.getInt(KEY_AC_MAIN, 22)
+        vehicleState.acDeputyTemp = prefs.getInt(KEY_AC_DEPUTY, 22)
+        vehicleState.seatLevel = prefs.getInt(KEY_SEAT_LEVEL, 0)
+    }
+
+    // ==================== 页面渲染（纯代码构建 View，避免资源 ID 冲突） ====================
+
+    /** 页面注册表：pageId → 构建函数。新增页面只需在此加一行，并写对应的构建函数。 */
+    private val pages: Map<String, () -> View> = mapOf(
+        "home" to { buildHomePage() },
+        "car" to { buildCarPage() },
+        "seat" to { buildSeatPage() },
+    )
+
+    /** 壳交出页面容器，插件开始渲染当前页面（Activity 重建也会重新调用，直接按当前状态重绘）。 */
+    private fun bindUi(container: ViewGroup) {
+        pageContainer = container
+        Log.i(tag, "ui.bind: 页面容器已就绪，当前页面=$currentPageId")
+        if (currentPageId == "car") loadAcState()
+        refreshCurrentPage()
+    }
+
+    /** Activity 销毁，断开容器持有——插件是进程级单例，不能强持有已销毁的 Activity。 */
     private fun unbindUi() {
         pageContainer?.removeAllViews()
         pageContainer = null
         Log.i(tag, "ui.unbind: 页面容器已解绑")
     }
 
-    /** 压入新页面并显示 */
-    private fun pushPage(view: View) {
-        pageStack.addLast(view)
-        renderTop()
-    }
-
-    /** 弹出栈顶页面（返回上一页） */
-    private fun popPage() {
-        if (pageStack.size > 1) {
-            pageStack.removeLast()
-            renderTop()
+    /**
+     * 真正切换到另一个页面（跟同页内数值调整的 refreshCurrentPage 区分开）：
+     * 更新 currentPageId、持久化、如果切到空调页顺带刷新一次真实车况，
+     * 最后交给 refreshCurrentPage() 重绘并同步给 knob。不管是旋钮 Tab
+     * 触发的还是页面内点按钮触发的，都走这一个函数，保证两条路径下
+     * knob 收到的通知是一致的。
+     */
+    private fun switchToPage(pageId: String) {
+        if (!pages.containsKey(pageId)) {
+            Log.w(tag, "未知页面: $pageId")
+            return
         }
+        currentPageId = pageId
+        if (pageId == "car") loadAcState()
+        persistState()
+        refreshCurrentPage()
     }
 
-    /** 把栈顶页面显示到容器 */
-    private fun renderTop() {
+    /** 用当前状态重绘 currentPageId 对应的页面，并同步给 knob——数值调整（不切页）时用这个。 */
+    private fun refreshCurrentPage() {
         val container = pageContainer ?: return
-        val top = pageStack.lastOrNull() ?: return
+        val builder = pages[currentPageId] ?: return
         container.removeAllViews()
-        val lp = ViewGroup.LayoutParams(
+        container.addView(builder(), ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
-        )
-        container.addView(top, lp)
+        ))
+        syncToKnob()
     }
 
-    /** 页面注册表：pageId → 构建函数。新增页面只需在此加一行，并写对应的构建函数。 */
-    private val pages: Map<String, (Map<String, Any>) -> View> = mapOf(
-        "home" to { _ -> buildHomePage() },
-        // 每次从别的页面跳进来都重新读一次车况，保证刚进页面时看到的是真实值；
-        // buildCarPage() 本身只读本地状态，不碰 HAL，用来在页内调整时重建视图。
-        "car" to { _ -> loadAcState(); buildCarPage() },
-        "seat" to { _ -> buildSeatPage() },
-    )
-
-    /** 按 pageId 显示页面（查注册表，构建后压栈显示）。返回是否成功。 */
-    private fun showPage(pageId: String, params: Map<String, Any> = emptyMap()): Boolean {
-        val builder = pages[pageId] ?: run {
-            Log.w(tag, "未知页面: $pageId")
-            return false
-        }
-        pushPage(builder(params))
-        return true
-    }
-
-    // ---- 页面构建（用 Ui 纯代码构建，避免资源 ID 冲突）----
-
-    /** 首页：跳转到空调页 / 座椅页 */
+    /** 首页：跳转到空调页 / 座椅页（纯菜单，不接旋钮 Tab 循环） */
     private fun buildHomePage(): View {
         val ctx = appContext!!
         return Ui.vStack(ctx).apply {
             gravity = Gravity.CENTER
             setBackgroundColor(Color.parseColor("#FFFFFF"))
             addView(Ui.title(ctx, "🎛 插件首页"))
-            addView(Ui.hint(ctx, "三个示例页面互相跳转\n页面栈由插件自管，back 键可返回"))
+            addView(Ui.hint(ctx, "旋钮单击在空调页/座椅页之间循环切换\n首页只能触屏进入"))
             addView(Ui.space(ctx, 0, 12))
-            addView(Ui.btn(ctx, "❄️ 去空调页") { showPage("car") })
-            addView(Ui.btn(ctx, "🪑 去座椅页") { showPage("seat") })
+            addView(Ui.btn(ctx, "❄️ 去空调页") { switchToPage("car") })
+            addView(Ui.btn(ctx, "🪑 去座椅页") { switchToPage("seat") })
         }
     }
 
-    /** 从车况刷新分控开关 + 两个区域的默认温度（进车控页时调一次，不在页内交互时调）。 */
+    /** 从车况刷新分控开关 + 两个区域的默认温度（进空调页时调，页内调整不调）。 */
     private fun loadAcState() {
+        if (SIMULATE_CAR_CONTROL) {
+            host?.log("🧪（模拟）跳过读取车况，沿用当前本地值")
+            return
+        }
         val ctrl = carControl ?: return
         val context = appContext ?: return
-        acSeparate = ctrl.getAcTemperatureControlMode(context) == CarControl.AC_TEMPCTRL_SEPARATE_ON
-        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN_DEPUTY)?.let { acMainDeputyValue = it }
-        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN)?.let { acMainValue = it }
-        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_DEPUTY)?.let { acDeputyValue = it }
+        vehicleState.acSeparate = ctrl.getAcTemperatureControlMode(context) == CarControl.AC_TEMPCTRL_SEPARATE_ON
+        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN_DEPUTY)?.let { vehicleState.acMainDeputyTemp = it }
+        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN)?.let { vehicleState.acMainTemp = it }
+        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_DEPUTY)?.let { vehicleState.acDeputyTemp = it }
+        persistState()
     }
 
     /** 分控关：一组联动温度框；分控开：主驾/副驾各一组。 */
@@ -426,35 +521,35 @@ class MainPlugin : KnobPlugin {
             setBackgroundColor(Color.parseColor("#E3F2FD"))
             addView(Ui.title(ctx, "❄️ 空调温度"))
             addView(Ui.space(ctx, 0, 8))
-            addView(Ui.btn(ctx, if (acSeparate) "分控：开（点击关闭）" else "分控：关（点击开启）") {
+            addView(Ui.btn(ctx, if (vehicleState.acSeparate) "分控：开（点击关闭）" else "分控：关（点击开启）") {
                 toggleAcSeparate()
             })
             addView(Ui.space(ctx, 0, 12))
-            if (!acSeparate) {
+            if (!vehicleState.acSeparate) {
                 addView(buildTempRow(
                     label = "联动温度",
-                    value = acMainDeputyValue,
-                    onChange = { acMainDeputyValue = it; refreshCarPage() },
-                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN_DEPUTY, acMainDeputyValue) }
+                    value = vehicleState.acMainDeputyTemp,
+                    onChange = { vehicleState.acMainDeputyTemp = it; persistState(); refreshCurrentPage() },
+                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN_DEPUTY, vehicleState.acMainDeputyTemp) }
                 ))
             } else {
                 addView(buildTempRow(
                     label = "主驾温度",
-                    value = acMainValue,
-                    onChange = { acMainValue = it; refreshCarPage() },
-                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN, acMainValue) }
+                    value = vehicleState.acMainTemp,
+                    onChange = { vehicleState.acMainTemp = it; persistState(); refreshCurrentPage() },
+                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN, vehicleState.acMainTemp) }
                 ))
                 addView(Ui.space(ctx, 0, 8))
                 addView(buildTempRow(
                     label = "副驾温度",
-                    value = acDeputyValue,
-                    onChange = { acDeputyValue = it; refreshCarPage() },
-                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_DEPUTY, acDeputyValue) }
+                    value = vehicleState.acDeputyTemp,
+                    onChange = { vehicleState.acDeputyTemp = it; persistState(); refreshCurrentPage() },
+                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_DEPUTY, vehicleState.acDeputyTemp) }
                 ))
             }
             addView(Ui.space(ctx, 0, 12))
-            addView(Ui.btn(ctx, "🪑 去座椅页") { showPage("seat") })
-            addView(Ui.btn(ctx, "← 返回首页") { popPage() })
+            addView(Ui.btn(ctx, "🪑 去座椅页") { switchToPage("seat") })
+            addView(Ui.btn(ctx, "← 返回首页") { switchToPage("home") })
         }
     }
 
@@ -478,45 +573,77 @@ class MainPlugin : KnobPlugin {
 
     /** 切分控：调用 setAcTemperatureControlMode，返回码非 null 就认为成功，直接翻本地状态。 */
     private fun toggleAcSeparate() {
+        if (SIMULATE_CAR_CONTROL) {
+            vehicleState.acSeparate = !vehicleState.acSeparate
+            host?.log("🧪（模拟）setAcTemperatureControlMode separate=${vehicleState.acSeparate}")
+            persistState()
+            refreshCurrentPage()
+            return
+        }
         val ctrl = carControl ?: return
         val context = appContext ?: return
-        val result = ctrl.setAcTemperatureControlMode(context, !acSeparate)
+        val result = ctrl.setAcTemperatureControlMode(context, !vehicleState.acSeparate)
         if (result != null) {
-            acSeparate = !acSeparate
-            refreshCarPage()
+            vehicleState.acSeparate = !vehicleState.acSeparate
+            persistState()
+            refreshCurrentPage()
         }
     }
 
     /** OK 键：真正下发 setAcTemperature，source 固定 UI_KEY（CarControl 内部已带）。 */
     private fun commitAcTemperature(type: Int, value: Int) {
+        if (SIMULATE_CAR_CONTROL) {
+            host?.log("🧪（模拟）setAcTemperature type=$type value=$value")
+            return
+        }
         val ctrl = carControl ?: return
         val context = appContext ?: return
         ctrl.setAcTemperature(context, type, value)
     }
 
-    /** 用当前本地状态重建车控页并替换栈顶，不入栈新页面、不重新读车况。 */
-    private fun refreshCarPage() {
-        if (pageStack.isNotEmpty()) pageStack.removeLast()
-        pageStack.addLast(buildCarPage())
-        renderTop()
-    }
-
-    /** 座椅页：跳转到首页 / 返回空调页 */
+    /** 座椅页：跳转到首页 / 空调页（占位页面，还没接真实座椅通风状态）。 */
     private fun buildSeatPage(): View {
         val ctx = appContext!!
         return Ui.vStack(ctx).apply {
             gravity = Gravity.CENTER
             setBackgroundColor(Color.parseColor("#E8F5E9"))
-            addView(Ui.title(ctx, "🪑 座椅页"))
-            addView(Ui.label(ctx, "这里是座椅控制示例页面"))
+            addView(Ui.title(ctx, "🪑 座椅"))
             addView(Ui.space(ctx, 0, 12))
-            addView(Ui.btn(ctx, "🎛 回首页") { showPage("home") })
-            addView(Ui.btn(ctx, "❄️ 去空调页") { showPage("car") })
+            addView(buildSeatRow())
+            addView(Ui.space(ctx, 0, 12))
+            addView(Ui.btn(ctx, "❄️ 去空调页") { switchToPage("car") })
+            addView(Ui.btn(ctx, "← 返回首页") { switchToPage("home") })
+        }
+    }
+
+    /**
+     * 座椅的"标签 － 档位 ＋ OK"，跟 buildTempRow 不共用是因为这里显示的
+     * 是"通风2档"这种文字档位，不是"数值+单位"，格式完全不同。
+     * －/＋ 只改本地待提交档位，OK 才真正下发。
+     */
+    private fun buildSeatRow(): View {
+        val ctx = appContext!!
+        val level = vehicleState.seatLevel
+        return Ui.card(ctx).apply {
+            addView(Ui.label(ctx, "座椅"))
+            addView(Ui.hStack(ctx).apply {
+                addView(Ui.btn(ctx, "－") {
+                    vehicleState.seatLevel = (level - 1).coerceIn(SEAT_LEVEL_MIN, SEAT_LEVEL_MAX)
+                    persistState()
+                    refreshCurrentPage()
+                })
+                addView(Ui.text(ctx, seatLevelLabel(level), size = 18f, bold = true))
+                addView(Ui.btn(ctx, "＋") {
+                    vehicleState.seatLevel = (level + 1).coerceIn(SEAT_LEVEL_MIN, SEAT_LEVEL_MAX)
+                    persistState()
+                    refreshCurrentPage()
+                })
+                addView(Ui.btn(ctx, "OK") { commitSeatLevel(vehicleState.seatLevel) })
+            })
         }
     }
 
     override fun onDestroy() {
         Log.i(tag, "MainPlugin.onDestroy")
-        pageStack.clear()
     }
 }
