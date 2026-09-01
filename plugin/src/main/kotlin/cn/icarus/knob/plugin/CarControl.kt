@@ -193,6 +193,18 @@ class CarControl(private val logger: KnobHost) {
         }
     }
 
+    fun getAcTemperatureControlMode(context: Context): Int? {
+        if (acDevice == null && !initAcDevice(context)) return null
+        return try {
+            val result = acDevice!!.getAcTemperatureControlMode()
+            log("◀ 空调分控模式 = $result ($AC_TEMPCTRL_SEPARATE_OFF=关,$AC_TEMPCTRL_SEPARATE_ON=开)")
+            result
+        } catch (e: Throwable) {
+            log("⚠️ 读取分控模式失败: ${e.message}")
+            null
+        }
+    }
+
     fun setAcPower(context: Context, on: Boolean): Int? {
         if (acDevice == null && !initAcDevice(context)) return null
         return try {

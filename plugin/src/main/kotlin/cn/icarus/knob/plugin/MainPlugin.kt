@@ -34,6 +34,15 @@ class MainPlugin : KnobPlugin {
     private var pageContainer: ViewGroup? = null
     private val pageStack = ArrayDeque<View>()
 
+    // ---- 空调温度页状态 ----
+    // 分控开关的真实车况只在进页面时读一次（loadAcState），后续调整/OK都只
+    // 改这几个本地字段再重建页面，不追加读接口——写操作是否生效以返回码为准
+    // （CarControl 内部已经把返回码打进日志），不额外重新查一次确认。
+    private var acSeparate = false
+    private var acMainDeputyValue = 22
+    private var acMainValue = 22
+    private var acDeputyValue = 22
+
     override fun init(context: Context, host: KnobHost) {
         Log.i(tag, "MainPlugin.init 调用")
         appContext = context
@@ -304,7 +313,9 @@ class MainPlugin : KnobPlugin {
     /** 页面注册表：pageId → 构建函数。新增页面只需在此加一行，并写对应的构建函数。 */
     private val pages: Map<String, (Map<String, Any>) -> View> = mapOf(
         "home" to { _ -> buildHomePage() },
-        "car" to { _ -> buildCarPage() },
+        // 每次从别的页面跳进来都重新读一次车况，保证刚进页面时看到的是真实值；
+        // buildCarPage() 本身只读本地状态，不碰 HAL，用来在页内调整时重建视图。
+        "car" to { _ -> loadAcState(); buildCarPage() },
         "seat" to { _ -> buildSeatPage() },
     )
 
@@ -334,18 +345,97 @@ class MainPlugin : KnobPlugin {
         }
     }
 
-    /** 空调页：跳转到座椅页 / 返回首页 */
+    /** 从车况刷新分控开关 + 两个区域的默认温度（进车控页时调一次，不在页内交互时调）。 */
+    private fun loadAcState() {
+        val ctrl = carControl ?: return
+        val context = appContext ?: return
+        acSeparate = ctrl.getAcTemperatureControlMode(context) == CarControl.AC_TEMPCTRL_SEPARATE_ON
+        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN_DEPUTY)?.let { acMainDeputyValue = it }
+        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN)?.let { acMainValue = it }
+        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_DEPUTY)?.let { acDeputyValue = it }
+    }
+
+    /** 分控关：一组联动温度框；分控开：主驾/副驾各一组。 */
     private fun buildCarPage(): View {
         val ctx = appContext!!
         return Ui.vStack(ctx).apply {
             gravity = Gravity.CENTER
             setBackgroundColor(Color.parseColor("#E3F2FD"))
-            addView(Ui.title(ctx, "❄️ 空调页"))
-            addView(Ui.label(ctx, "这里是空调控制示例页面"))
+            addView(Ui.title(ctx, "❄️ 空调温度"))
+            addView(Ui.space(ctx, 0, 8))
+            addView(Ui.btn(ctx, if (acSeparate) "分控：开（点击关闭）" else "分控：关（点击开启）") {
+                toggleAcSeparate()
+            })
+            addView(Ui.space(ctx, 0, 12))
+            if (!acSeparate) {
+                addView(buildTempRow(
+                    label = "联动温度",
+                    value = acMainDeputyValue,
+                    onChange = { acMainDeputyValue = it; refreshCarPage() },
+                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN_DEPUTY, acMainDeputyValue) }
+                ))
+            } else {
+                addView(buildTempRow(
+                    label = "主驾温度",
+                    value = acMainValue,
+                    onChange = { acMainValue = it; refreshCarPage() },
+                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN, acMainValue) }
+                ))
+                addView(Ui.space(ctx, 0, 8))
+                addView(buildTempRow(
+                    label = "副驾温度",
+                    value = acDeputyValue,
+                    onChange = { acDeputyValue = it; refreshCarPage() },
+                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_DEPUTY, acDeputyValue) }
+                ))
+            }
             addView(Ui.space(ctx, 0, 12))
             addView(Ui.btn(ctx, "🪑 去座椅页") { showPage("seat") })
             addView(Ui.btn(ctx, "← 返回首页") { popPage() })
         }
+    }
+
+    /** 一组"标签 － 数值 ＋ OK"。－/＋ 只改本地待提交值，OK 才真正下发。 */
+    private fun buildTempRow(label: String, value: Int, onChange: (Int) -> Unit, onOk: () -> Unit): View {
+        val ctx = appContext!!
+        return Ui.card(ctx).apply {
+            addView(Ui.label(ctx, label))
+            addView(Ui.hStack(ctx).apply {
+                addView(Ui.btn(ctx, "－") {
+                    onChange((value - 1).coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX))
+                })
+                addView(Ui.text(ctx, "${value}°C", size = 18f, bold = true))
+                addView(Ui.btn(ctx, "＋") {
+                    onChange((value + 1).coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX))
+                })
+                addView(Ui.btn(ctx, "OK") { onOk() })
+            })
+        }
+    }
+
+    /** 切分控：调用 setAcTemperatureControlMode，返回码非 null 就认为成功，直接翻本地状态。 */
+    private fun toggleAcSeparate() {
+        val ctrl = carControl ?: return
+        val context = appContext ?: return
+        val result = ctrl.setAcTemperatureControlMode(context, !acSeparate)
+        if (result != null) {
+            acSeparate = !acSeparate
+            refreshCarPage()
+        }
+    }
+
+    /** OK 键：真正下发 setAcTemperature，source 固定 UI_KEY（CarControl 内部已带）。 */
+    private fun commitAcTemperature(type: Int, value: Int) {
+        val ctrl = carControl ?: return
+        val context = appContext ?: return
+        ctrl.setAcTemperature(context, type, value)
+    }
+
+    /** 用当前本地状态重建车控页并替换栈顶，不入栈新页面、不重新读车况。 */
+    private fun refreshCarPage() {
+        if (pageStack.isNotEmpty()) pageStack.removeLast()
+        pageStack.addLast(buildCarPage())
+        renderTop()
     }
 
     /** 座椅页：跳转到首页 / 返回空调页 */
