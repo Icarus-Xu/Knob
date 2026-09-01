@@ -16,20 +16,14 @@ object KnobHostImpl : KnobHost {
     }
 
     /**
-     * 插件请求壳发送数据到 knob（屏显/指令）。
-     * 目前只有 {"module": Int, "value": Int} 这一种用法（同步旋钮屏幕
-     * 当前显示的车控模块+数值），对应 firmware/src/ble.cpp 里那个自定义
-     * 可写特征值的 3 字节格式。
+     * 插件请求壳发送数据到 knob（屏显/指令）。壳在这里完全不理解字段
+     * 含义——原样把 Map 交给 BleManager 编码转发，插件传什么 key/值就
+     * 发什么，字段的意义由插件和固件两边自己约定。以后插件要加/改显示
+     * 字段，这一层不用跟着改。
      */
     override fun pushToKnob(data: Map<String, Any>) {
         val text = data.map { "${it.key}=${it.value}" }.joinToString(", ")
-        val module = (data["module"] as? Number)?.toInt()
-        val value = (data["value"] as? Number)?.toInt()
-        if (module == null || value == null) {
-            LogSink.append("[插件→knob] pushToKnob 参数不对：$text（需要 module/value）")
-            return
-        }
-        val sent = BleManager.write(module, value)
+        val sent = BleManager.write(data)
         LogSink.append("[插件→knob] pushToKnob: $text -> ${if (sent) "已发送" else "发送失败（GATT 未就绪）"}")
     }
 }

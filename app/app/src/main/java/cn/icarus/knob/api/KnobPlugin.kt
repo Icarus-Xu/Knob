@@ -49,7 +49,8 @@ interface KnobPlugin {
      * 事件域：外部事件。
      * @param event 事件名，约定：
      *   "key"           params: {code: Int, action: Int}
-     *                   壳转发的按键：蓝牙 HID 旋钮/按键、车机物理键、系统返回键都走这里。
+     *                   壳转发的按键：蓝牙旋钮/按键（自定义 BLE GATT 通知，见 BleManager）、
+     *                   车机物理键、系统返回键都走这里。
      *                   code = KeyEvent.KEYCODE_*，action = KeyEvent.ACTION_DOWN / ACTION_UP。
      *                   消费某个键时**按下与抬起要成对返回 true**，只吃一半会让系统按键状态错乱。
      *   "ui.bind"       params: {container: ViewGroup} 壳把页面容器交给插件，插件开始渲染并自管页面栈
@@ -57,7 +58,7 @@ interface KnobPlugin {
      * @param params 事件参数
      * @return 是否消费了该事件
      *
-     * 注意：壳进程常驻（无障碍服务绑定），Activity 会反复创建销毁。
+     * 注意：Activity 会反复创建销毁（配置变化、被系统回收等），
      * 插件收到 "ui.unbind" 必须清干净 View 的 parent 引用，否则会泄漏已销毁的 Activity，
      * 且下次 "ui.bind" 复用旧 View 时会抛 "already has a parent"。
      */

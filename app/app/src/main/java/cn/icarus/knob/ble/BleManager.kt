@@ -2,11 +2,11 @@ package cn.icarus.knob.ble
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
@@ -15,20 +15,31 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.KeyEvent
+import cn.icarus.knob.plugin.PluginLoader
 import cn.icarus.knob.util.LogSink
 import java.util.UUID
 
 /**
- * phone → ESP32 knob 的 BLE 写入通道。
+ * phone <-> ESP32 knob 的唯一 BLE 通道。
  *
- * 跟 knob 广播的标准 HID 键盘连接是完全独立的两条通道，共存不冲突：
- * HID 那条是系统蓝牙栈管的输入设备连接，这条是 App 自己发起的 GATT
- * client 连接（同一个物理蓝牙链路上可以叠加多个 profile）。
+ * 不走标准 BLE HID 键盘 profile：旋钮以前伪装成 HID 键盘，靠手机侧无障碍
+ * 服务在系统层拦截按键，但车机的定制系统没有暴露标准无障碍设置入口
+ * （跳转直接崩 ActivityNotFoundException），这条路走不通。现在旋钮的
+ * 每个动作都通过下面这个自定义特征值以 NOTIFY 的方式直接通知给手机，
+ * 收到后直接转发给插件，不再经过系统按键分发这一层。
  *
- * 对应固件那边 firmware/src/ble.cpp 里新增的自定义特征值：
- *   service UUID:        29afa70d-2312-4f04-9b36-fe9298284756
- *   characteristic UUID: 5f774e59-5079-4e69-8e5d-de0ee1220d3f
- *   payload: 3 字节，byte0=module(0/1)，byte1..2=小端 int16 value
+ * 对应固件那边 firmware/src/ble.cpp 里的自定义服务：
+ *   service UUID:              29afa70d-2312-4f04-9b36-fe9298284756
+ *   按键事件特征值（NOTIFY）：   182f303d-ea98-4ee4-839e-5599aaf3f29d
+ *     payload: 2 字节，小端 int16 = Android KeyEvent.KEYCODE_* 值
+ *   显示同步特征值（WRITE）：    5f774e59-5079-4e69-8e5d-de0ee1220d3f
+ *     payload: 通用键值对编码，见 write(Map) / encodeDisplayData() 的
+ *     注释——这里（跟固件 ble.cpp 对应）完全不理解字段含义，插件传什么
+ *     Map 就原样编码成字节流搬过去，固件那边自己认哪些 key。以后加/改
+ *     显示字段只需要同时改插件和固件，不用碰这一层。payload 可能超过
+ *     默认 ATT MTU（23 字节）能装下的量，连上后会先请求更大 MTU 再发现
+ *     服务，见 gattCallback 里的 requestMtu()。
  */
 object BleManager {
     private const val TAG = "BleManager"
@@ -36,10 +47,14 @@ object BleManager {
     // 跟 firmware/src/ble.cpp 的 build_device_name() 命名约定对上。
     private const val DEVICE_NAME_PREFIX = "Knob-"
     private val SERVICE_UUID = UUID.fromString("29afa70d-2312-4f04-9b36-fe9298284756")
-    private val CHARACTERISTIC_UUID = UUID.fromString("5f774e59-5079-4e69-8e5d-de0ee1220d3f")
+    private val KEY_EVENT_CHARACTERISTIC_UUID = UUID.fromString("182f303d-ea98-4ee4-839e-5599aaf3f29d")
+    private val DISPLAY_CHARACTERISTIC_UUID = UUID.fromString("5f774e59-5079-4e69-8e5d-de0ee1220d3f")
+    // 标准 BLE 描述符 UUID：Client Characteristic Configuration，订阅 NOTIFY 靠写这个。
+    private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     private var gatt: BluetoothGatt? = null
-    private var characteristic: BluetoothGattCharacteristic? = null
+    private var displayCharacteristic: BluetoothGattCharacteristic? = null
+    private var keyEventCharacteristic: BluetoothGattCharacteristic? = null
 
     // 这个项目一直没有 adb（见 docs/验证结论.md），日志得打进 App 里那个
     // 滚动窗口才看得见——Log.x() 只是留个习惯，真正调试靠这个。
@@ -61,10 +76,10 @@ object BleManager {
             PackageManager.PERMISSION_GRANTED
     }
 
-    /** GATT 是不是已经连上（可以直接 write() 了还得看 characteristic 是否也发现了，这里只看连接本身）。 */
+    /** GATT 是不是已经连上（能不能马上用还得看两个特征值是否都发现了，这里只看连接本身）。 */
     fun isConnected(): Boolean = gatt != null
 
-    private const val RECONNECT_POLL_INTERVAL_MS = 15_000L
+    private const val RECONNECT_POLL_INTERVAL_MS = 5_000L
     private val pollHandler = Handler(Looper.getMainLooper())
     private var pollingStarted = false
 
@@ -83,12 +98,16 @@ object BleManager {
 
     private lateinit var appContext: Context
 
-    /** 启动重连轮询，进程生命周期内只需要调一次（在 KnobApp.onCreate() 里调用）。 */
+    /**
+     * 启动重连轮询，进程生命周期内只需要调一次（在 KnobApp.onCreate() 里调用）。
+     * 第一次立刻查一次（不等 15 秒），后续才按间隔轮询——进程刚启动时
+     * 大概率之前已经配对过，没必要让用户干等一整个轮询周期才连上。
+     */
     fun startReconnectPolling(context: Context) {
         if (pollingStarted) return
         pollingStarted = true
         appContext = context.applicationContext
-        pollHandler.postDelayed(pollRunnable, RECONNECT_POLL_INTERVAL_MS)
+        pollHandler.post(pollRunnable)
     }
 
     /**
@@ -129,53 +148,197 @@ object BleManager {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    logBoth("GATT 已连接，开始发现服务")
-                    g.discoverServices()
+                    // 顺手提示系统这条连接要低延迟（配合固件那边主动请求的
+                    // 短连接间隔），不是这次卡顿的关键，但不吃亏。
+                    g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                    // 先协商更大的 MTU 再发现服务——默认 ATT MTU 只有 23 字节，
+                    // 装不下带中文标题的显示同步 payload。onMtuChanged() 里
+                    // 才真正调 discoverServices()，不管协商成不成功都会继续
+                    // （失败了就退回默认 MTU，标题超长时截断，不阻塞连接）。
+                    logBoth("GATT 已连接，请求更大 MTU")
+                    g.requestMtu(185)
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     // autoConnect=false 下断开不会自动重连，得关掉这个 GATT
-                    // 对象、清空状态，下次调 init() 才会重新发起连接。
-                    logBoth("GATT 断开（status=$status），已停止，下次调用 init() 会重新连接", isWarning = true)
+                    // 对象、清空状态，下次调用 init() 才会重新连接。
+                    logBoth("GATT 断开（status=$status），已停止", isWarning = true)
                     g.close()
                     gatt = null
-                    characteristic = null
+                    displayCharacteristic = null
+                    keyEventCharacteristic = null
+                    notifyPluginBluetoothState(connected = false)
+                    // 断线的这一刻就立刻重试，不等下一次轮询（最多可能再等
+                    // 15 秒）——knob 断电重启的话，手机检测到断线时它大概率
+                    // 已经在重新广播了，直接连大概率能一次成功；连不上的话
+                    // 轮询还是会作为兜底继续重试。
+                    init(appContext)
                 }
             }
         }
 
+        @SuppressLint("MissingPermission")
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            logBoth("MTU 协商结果=$mtu (status=$status)，开始发现服务")
+            g.discoverServices()
+        }
+
+        @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            val char = g.getService(SERVICE_UUID)?.getCharacteristic(CHARACTERISTIC_UUID)
-            if (char == null) {
-                logBoth("没找到自定义特征值（service/characteristic UUID 对不上，固件版本可能太旧）", isWarning = true)
+            val service = g.getService(SERVICE_UUID)
+            if (service == null) {
+                logBoth("没找到自定义服务（UUID 对不上，固件版本可能太旧）", isWarning = true)
                 return
             }
-            characteristic = char
-            logBoth("自定义特征值已就绪，可以调用 write() 了")
+
+            displayCharacteristic = service.getCharacteristic(DISPLAY_CHARACTERISTIC_UUID)
+            logBoth(if (displayCharacteristic != null) "显示同步特征值已就绪" else "没找到显示同步特征值", isWarning = displayCharacteristic == null)
+
+            val keyChar = service.getCharacteristic(KEY_EVENT_CHARACTERISTIC_UUID)
+            // GATT 同一时刻只能有一个写操作在飞，两个写操作前后脚发起
+            // 后面那个会被直接拒绝——如果 CCCD 订阅写真的发出去了
+            // （waitingForCccd=true），"通知插件已连接"（会触发插件的
+            // syncToKnob() 写显示特征值）就得等它在 onDescriptorWrite()
+            // 里真正完成之后再做，不能在这里就地通知，会跟这个写操作撞车。
+            val waitingForCccd = if (keyChar == null) {
+                logBoth("没找到按键事件特征值", isWarning = true)
+                false
+            } else {
+                keyEventCharacteristic = keyChar
+                subscribeKeyEvents(g, keyChar)
+            }
+            if (!waitingForCccd && displayCharacteristic != null) {
+                notifyPluginBluetoothState(connected = true, device = g.device)
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            logBoth(
+                if (status == BluetoothGatt.GATT_SUCCESS) "按键事件通知订阅完成" else "按键事件通知订阅失败 status=$status",
+                isWarning = status != BluetoothGatt.GATT_SUCCESS
+            )
+            // CCCD 这个写操作真正完成了，这时候再通知插件已连接（触发
+            // syncToKnob() 写显示特征值）才不会跟它撞车。
+            if (displayCharacteristic != null) {
+                notifyPluginBluetoothState(connected = true, device = g.device)
+            }
+        }
+
+        // API 33+ 路径。
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            if (characteristic.uuid == KEY_EVENT_CHARACTERISTIC_UUID) handleKeyEventNotification(value)
+        }
+
+        // API < 33 路径——33+ 时上面那个新回调已经处理过，这里直接跳过，
+        // 不然同一个通知会被处理两遍。
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
+            if (characteristic.uuid == KEY_EVENT_CHARACTERISTIC_UUID) handleKeyEventNotification(characteristic.value)
         }
     }
 
     /**
-     * 把 module/value 编码成 3 字节写给 knob。
+     * 订阅按键事件特征值：本地开启通知回调 + 写 CCCD 描述符告诉外设
+     * "开始推送"，两步都要做，缺一个都收不到通知。
+     * @return CCCD 写请求是不是真的发出去了——true 的话调用方要等
+     *   onDescriptorWrite() 回调才算这个操作完成；false 的话（没找到
+     *   特征值/描述符，或者写请求本身就同步失败）不会有回调，调用方
+     *   不能傻等。
+     */
+    @SuppressLint("MissingPermission")
+    private fun subscribeKeyEvents(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic): Boolean {
+        if (!g.setCharacteristicNotification(characteristic, true)) {
+            logBoth("setCharacteristicNotification 失败，按键事件收不到", isWarning = true)
+            return false
+        }
+        val cccd = characteristic.getDescriptor(CCCD_UUID)
+        if (cccd == null) {
+            logBoth("按键事件特征值没有 CCCD 描述符，收不到通知", isWarning = true)
+            return false
+        }
+        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            g.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothGatt.GATT_SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            @Suppress("DEPRECATION")
+            g.writeDescriptor(cccd)
+        }
+        logBoth(if (ok) "已发起按键事件通知订阅" else "订阅按键事件通知失败", isWarning = !ok)
+        return ok
+    }
+
+    // BluetoothGattCallback 的回调（包括 onCharacteristicChanged）跑在蓝牙
+    // Binder 线程上，不是主线程——插件的按键处理会碰 View（切页面时
+    // removeAllViews/addView），必须先切回主线程再转发，不然直接抛
+    // CalledFromWrongThreadException，还会被 onEvent() 的 try/catch 吞掉，
+    // 表现成"插件未处理"+页面被清空但没画上新内容（残留空白）。
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * 收到一次按键通知：2 字节小端 int16 = Android KeyEvent.KEYCODE_*。
+     * 按下+抬起都转发给插件（跟以前无障碍服务转发系统按键时的语义一致，
+     * 只吃一半会让插件内部按键状态错乱），插件不处理时这里没有壳兜底可吃
+     * ——不再走系统按键分发，没有"焦点被移动/按钮被点击"这类风险了。
+     */
+    private fun handleKeyEventNotification(value: ByteArray) {
+        if (value.size < 2) {
+            logBoth("按键通知长度不对（${value.size} 字节）", isWarning = true)
+            return
+        }
+        val low = value[0].toInt() and 0xFF
+        val high = value[1].toInt() and 0xFF
+        val code = (high shl 8) or low
+        logBoth("收到按键事件 code=$code")
+        mainHandler.post { dispatchKeyToPlugin(code) }
+    }
+
+    private fun dispatchKeyToPlugin(code: Int) {
+        PluginLoader.current?.onEvent("key", mapOf("code" to code, "action" to KeyEvent.ACTION_DOWN))
+        val consumed = PluginLoader.current?.onEvent("key", mapOf("code" to code, "action" to KeyEvent.ACTION_UP)) ?: false
+        logBoth(if (consumed) "  → 插件已处理" else "  → 插件未处理")
+    }
+
+    /**
+     * 通知插件蓝牙连接状态变化（复用 KnobPlugin.onPush("bluetooth", ...)
+     * 已经约定好的字段）。跟按键通知一样切回主线程再转发——onPush 目前
+     * 的实现不碰 View，但谁也不能保证以后不会加，统一走这条路更保险，
+     * 不用每加一个新回调入口都重新想一遍线程安全。
+     */
+    @SuppressLint("MissingPermission")
+    private fun notifyPluginBluetoothState(connected: Boolean, device: BluetoothDevice? = null) {
+        val data = if (connected && device != null) {
+            mapOf("connected" to true, "name" to (device.name ?: ""), "mac" to device.address)
+        } else {
+            mapOf("connected" to connected)
+        }
+        mainHandler.post { PluginLoader.current?.onPush("bluetooth", data) }
+    }
+
+    /**
+     * 把插件给的通用 Map 编码成字节流写给 knob——这里完全不理解字段
+     * 含义，只认值的 Kotlin 类型（Int/String/Boolean），不认 key 名。
      * @return 是否成功发起写入请求——GATT 写入本身是异步的，这里只代表
      *   "请求发出去了"，不代表对方已经收到（固件那边收到后会在串口打日志，
      *   要确认送达以那个为准）。
      */
     @SuppressLint("MissingPermission")
-    fun write(module: Int, value: Int): Boolean {
+    fun write(data: Map<String, Any>): Boolean {
         val g = gatt ?: run {
             logBoth("write() 失败：GATT 还没连上", isWarning = true)
             return false
         }
-        val char = characteristic ?: run {
-            logBoth("write() 失败：特征值还没发现（服务发现可能还没完成）", isWarning = true)
+        val char = displayCharacteristic ?: run {
+            logBoth("write() 失败：显示同步特征值还没发现（服务发现可能还没完成）", isWarning = true)
             return false
         }
-        val payload = byteArrayOf(
-            module.toByte(),
-            (value and 0xFF).toByte(),
-            ((value shr 8) and 0xFF).toByte()
-        )
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val payload = encodeDisplayData(data)
+        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             g.writeCharacteristic(char, payload, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) ==
                 BluetoothGatt.GATT_SUCCESS
         } else {
@@ -184,5 +347,56 @@ object BleManager {
             @Suppress("DEPRECATION")
             g.writeCharacteristic(char)
         }
+        // gatt/characteristic 都在，写请求本身却被拒绝——通常是 Android
+        // 同一时刻只能有一个 GATT 写操作在飞，跟另一个还没完成的写操作
+        // 撞车了（比如连接刚建立时的 CCCD 订阅写）。之前这个分支完全没
+        // 日志，排查的时候只能看到 KnobHostImpl 那句笼统的"GATT 未就绪"，
+        // 补一条能看出具体是这个原因。
+        if (!ok) {
+            logBoth("write() 失败：writeCharacteristic 请求被拒绝（可能跟另一个 GATT 操作撞车了）", isWarning = true)
+        }
+        return ok
+    }
+
+    /**
+     * 通用键值对编码——这一层不理解字段含义，只按值的 Kotlin 类型编码，
+     * 固件那边（firmware/src/ble.cpp 的 parse_display_data）按同样的格式
+     * 解码。每条 entry：
+     *   keyLen(1 字节) + key(ASCII, keyLen 字节)
+     *   + type(1 字节: 0=int16 / 1=string / 2=bool)
+     *   + 值本身：int16 是 2 字节小端；string 是 1 字节长度（裁到最多
+     *     60 字节）+ UTF-8 内容；bool 是 1 字节 0/1
+     * 不支持的值类型直接跳过并打警告日志，不中断其余字段的编码。
+     */
+    private fun encodeDisplayData(data: Map<String, Any>): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        for ((key, value) in data) {
+            val keyBytes = key.toByteArray(Charsets.US_ASCII).let { if (it.size > 255) it.copyOf(255) else it }
+            when (value) {
+                is Int -> {
+                    out.write(keyBytes.size)
+                    out.write(keyBytes)
+                    out.write(0)
+                    out.write(value and 0xFF)
+                    out.write((value shr 8) and 0xFF)
+                }
+                is String -> {
+                    val strBytes = value.toByteArray(Charsets.UTF_8).let { if (it.size > 60) it.copyOf(60) else it }
+                    out.write(keyBytes.size)
+                    out.write(keyBytes)
+                    out.write(1)
+                    out.write(strBytes.size)
+                    out.write(strBytes)
+                }
+                is Boolean -> {
+                    out.write(keyBytes.size)
+                    out.write(keyBytes)
+                    out.write(2)
+                    out.write(if (value) 1 else 0)
+                }
+                else -> logBoth("encodeDisplayData 跳过不支持的字段类型：$key=$value (${value::class.simpleName})", isWarning = true)
+            }
+        }
+        return out.toByteArray()
     }
 }
