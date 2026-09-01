@@ -1,7 +1,8 @@
 // Knob 固件。
-// 屏幕显示 UI + 旋转旋钮调数值 + 按压切换功能 + 长按"确认"——数值本身
-// 还是本地模拟（没有真的接车控），但旋钮的每个动作现在会同步通过 BLE
-// HID 发给配对的手机/车机：旋转→左右方向键，单击→Tab，长按→Enter。
+// 屏幕完全由手机推来的数据驱动（标题/数值/取值范围），固件自己不存
+// "当前是哪个功能、合法范围是多少"这些状态——旋钮只负责发按键事件
+// （转动→左右方向键，单击→Tab，长按→Enter，不走标准 HID 键盘 profile，
+// 见 ble.h 顶部注释），屏幕内容由插件那边处理完按键后异步推回来更新。
 // 方案见 docs/旋钮-最小硬件调试方案.md、docs/蓝牙控制配件-方案.md。
 
 #include <Arduino.h>
@@ -9,55 +10,69 @@
 #include "display.h"
 #include "encoder.h"
 #include "ble.h"
-#include <HijelHID_BLEKeyboard.h> // KEY_LEFT / KEY_RIGHT / KEY_TAB / KEY_RETURN 常量
-
-// 旋钮能控制的一个"功能"。这个 demo 不会真的去控制任何车上的
-// 硬件——转动旋钮只是在改内存里的 value 变量、然后重绘屏幕，
-// 这样可以先验证"输入 -> UI"这条链路完全没问题，之后再接真实的
-// 车控逻辑。
-struct FuncDef {
-    const char *name;
-    float min_value;
-    float max_value;
-    float step;      // 每转一档 value 变化多少
-    const char *unit;
-    float value;      // 当前值，随着转动旋钮被修改
-};
-
-static FuncDef s_functions[] = {
-    {"温度", 16.0f, 30.0f, 0.5f, "C", 22.5f},
-    {"风量", 0.0f, 7.0f, 1.0f, "档", 3.0f},
-    {"座椅加热", 0.0f, 3.0f, 1.0f, "档", 0.0f},
-};
-static const int FUNC_COUNT = sizeof(s_functions) / sizeof(s_functions[0]);
-static int s_current_func = 0; // 当前正在显示/调节的是 s_functions 里的哪一个
 
 // 后面需要更新的 LVGL 控件都存成全局变量，这样 build_ui()
-// （只创建一次）和 refresh_ui()（每次值变化都要更新）才都能访问到。
+// （只创建一次）和 on_display_update()（手机推数据来时更新）才都能访问到。
 static lv_obj_t *s_label_name;
 static lv_obj_t *s_label_value;
 static lv_obj_t *s_arc;
 
-// 把当前功能的名称/数值刷新到已经建好的控件上。
-// 这个函数不会创建新控件——第一次必须先调用 build_ui()。
-static void refresh_ui() {
-    const FuncDef &f = s_functions[s_current_func];
+// 浅蓝 -> 深蓝 -> 橙色 -> 红色，四段色标均匀分布在 [min,max] 上，两个
+// 页面共用同一套渐变：
+//   空调温度（min>=0，比如 17~33）：低温浅蓝、高温红，中间自然经过
+//   深蓝到橙色的过渡。
+//   座椅（min<0，比如 -2~2，0=关闭居中）：通风那一侧落在浅蓝/深蓝这
+//   两段，加热那一侧落在橙/红这两段，"关闭"正好卡在深蓝到橙色的过渡
+//   区——但那时候指示条长度是 0（见 on_display_update 的对称模式），
+//   这段颜色根本不会被画出来，不影响观感。
+static lv_color_t gradient_color(int16_t value, int16_t vmin, int16_t vmax) {
+    static const lv_color_t stops[4] = {
+        LV_COLOR_MAKE(0x64, 0xB5, 0xF6), // 浅蓝
+        LV_COLOR_MAKE(0x0D, 0x47, 0xA1), // 深蓝
+        LV_COLOR_MAKE(0xFF, 0x98, 0x00), // 橙色
+        LV_COLOR_MAKE(0xD5, 0x00, 0x00), // 红色
+    };
+    if (vmax <= vmin) return stops[0];
+    float t = (float)(value - vmin) / (float)(vmax - vmin); // 0..1
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    float seg = t * 3.0f; // 落在四段里的哪一段：0..3
+    int idx = (int)seg;
+    if (idx > 2) idx = 2;
+    float frac = seg - idx;
+    // lv_color_mix(c1, c2, mix)：mix=0 时是纯 c2，mix=255 时是纯 c1。
+    // frac=0 时要纯 stops[idx]，frac=1 时要纯 stops[idx+1]。
+    return lv_color_mix(stops[idx + 1], stops[idx], (uint8_t)(frac * 255));
+}
 
-    lv_label_set_text(s_label_name, f.name);
+// 手机同步了新的显示数据时调用（见 ble_on_display_update）。这里认的
+// "title"/"value"/"min"/"max" 几个 key 是跟插件那边约定好的，壳不参与
+// 这部分——以后要加新字段/新形状的页面，只需要同时改插件发什么 key、
+// 这里认哪些 key，不用碰壳。data 指向的缓冲区只在本次回调期间有效，
+// getString() 拿到的指针也是，LVGL 的 lv_label_set_text 内部会自己
+// 复制一份文本，不需要额外处理。
+static void on_display_update(const DisplayData &data) {
+    lv_label_set_text(s_label_name, data.getString("title"));
 
-    char buf[32];
-    if (f.step < 1.0f) {
-        snprintf(buf, sizeof(buf), "%.1f %s", f.value, f.unit);
-    } else {
-        snprintf(buf, sizeof(buf), "%.0f %s", f.value, f.unit);
-    }
+    int16_t value = data.getInt("value");
+    int16_t vmin = data.getInt("min");
+    int16_t vmax = data.getInt("max");
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", value);
     lv_label_set_text(s_label_value, buf);
 
-    // 把当前值映射成 0-100 的百分比显示在圆弧上，这样不管实际的
-    // min/max/单位是什么，圆弧看起来都是"进度走到哪了"的直观感觉。
-    int pct = (int)((f.value - f.min_value) / (f.max_value - f.min_value) * 100.0f);
-    lv_arc_set_value(s_arc, pct);
-    lv_obj_set_style_arc_color(s_arc, lv_palette_main(LV_PALETTE_BLUE), LV_PART_INDICATOR);
+    if (vmax > vmin) {
+        lv_arc_set_range(s_arc, vmin, vmax);
+        // min<0（比如座椅 -2~2，0=关闭居中）用 LVGL 内置的对称模式：
+        // 指示条从取值范围的中点（这里正好是 0）往两侧长，负值往一侧、
+        // 正值往另一侧——不用自己算角度，LVGL 按 range 中点自动处理。
+        // 其它情况（比如空调温度 17~33，没有"居中关闭"这个概念）还是
+        // 普通模式，从一端往另一端长。
+        lv_arc_set_mode(s_arc, vmin < 0 ? LV_ARC_MODE_SYMMETRICAL : LV_ARC_MODE_NORMAL);
+        lv_arc_set_value(s_arc, value);
+    }
+    lv_obj_set_style_arc_color(s_arc, gradient_color(value, vmin, vmax), LV_PART_INDICATOR);
 }
 
 // 创建所有控件，只在 setup() 里调用一次。
@@ -73,19 +88,19 @@ static void build_ui() {
     lv_arc_set_range(s_arc, 0, 100);
     lv_obj_remove_style(s_arc, NULL, LV_PART_KNOB); // 隐藏默认的可拖拽手柄，这里只是展示用，不需要能拖
     lv_obj_clear_flag(s_arc, LV_OBJ_FLAG_CLICKABLE); // 禁止点击/触摸拖动它
+    lv_obj_set_style_arc_color(s_arc, lv_palette_main(LV_PALETTE_BLUE), LV_PART_INDICATOR);
     lv_obj_center(s_arc);
 
     s_label_name = lv_label_create(scr);
     lv_obj_set_style_text_font(s_label_name, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_label_name, lv_color_white(), 0);
     lv_obj_align(s_label_name, LV_ALIGN_CENTER, 0, -30);
+    lv_label_set_text(s_label_name, "等待连接...");
 
     s_label_value = lv_label_create(scr);
     lv_obj_set_style_text_font(s_label_value, &lv_font_montserrat_26, 0);
     lv_obj_set_style_text_color(s_label_value, lv_color_white(), 0);
     lv_obj_align(s_label_value, LV_ALIGN_CENTER, 0, 5);
-
-    refresh_ui(); // 先刷一次初始值，不然标签一开始是空的
 }
 
 void setup() {
@@ -94,10 +109,11 @@ void setup() {
 
     display_init();
     encoder_init();
-    ble_init();
     build_ui();
+    ble_on_display_update(on_display_update);
+    ble_init();
 
-    Serial.println("[Knob] ready: rotate = adjust, click = switch function, long-press = confirm");
+    Serial.println("[Knob] ready: rotate/click/long-press send key events, screen follows phone");
 }
 
 void loop() {
@@ -106,43 +122,24 @@ void loop() {
     encoder_poll_button();
 
     int16_t diff = encoder_get_diff();
-    if (diff != 0) {
-        FuncDef &f = s_functions[s_current_func];
-        f.value += diff * f.step;
-        // 限幅，保证数值不会跑出合法范围。
-        if (f.value < f.min_value) f.value = f.min_value;
-        if (f.value > f.max_value) f.value = f.max_value;
-        refresh_ui();
-        Serial.printf("[ENC] %s = %.1f\n", f.name, f.value);
-
+    if (diff != 0 && ble_is_paired()) {
         // 快转一下可能一次性攒了好几档（见 encoder_get_diff 的说明），
         // 这里按实际档数补发对应次数的方向键，不是只发一下。
-        if (ble_is_paired()) {
-            uint8_t key = diff > 0 ? KEY_RIGHT : KEY_LEFT;
-            for (int16_t i = 0; i < abs(diff); i++) {
-                ble_tap(key);
-            }
+        int16_t key = diff > 0 ? KEYCODE_DPAD_RIGHT : KEYCODE_DPAD_LEFT;
+        for (int16_t i = 0; i < abs(diff); i++) {
+            ble_send_key(key);
         }
+        Serial.printf("[ENC] diff=%d\n", diff);
     }
 
-    if (encoder_take_click()) {
-        s_current_func = (s_current_func + 1) % FUNC_COUNT; // 转到最后一个之后回到第一个
-        refresh_ui();
-        Serial.printf("[BTN] switch -> %s\n", s_functions[s_current_func].name);
-        if (ble_is_paired()) {
-            ble_tap(KEY_TAB);
-        }
+    if (encoder_take_click() && ble_is_paired()) {
+        Serial.println("[BTN] click -> TAB");
+        ble_send_key(KEYCODE_TAB);
     }
 
-    if (encoder_take_long_press()) {
-        // 长按 = 确认：本地把圆弧闪一下绿色给你看，同时给配对的主机发
-        // 一个 Enter。
-        Serial.printf("[BTN] confirm %s = %.1f\n", s_functions[s_current_func].name,
-                       s_functions[s_current_func].value);
-        lv_obj_set_style_arc_color(s_arc, lv_palette_main(LV_PALETTE_GREEN), LV_PART_INDICATOR);
-        if (ble_is_paired()) {
-            ble_tap(KEY_RETURN);
-        }
+    if (encoder_take_long_press() && ble_is_paired()) {
+        Serial.println("[BTN] long-press -> ENTER");
+        ble_send_key(KEYCODE_ENTER);
     }
 
     display_task_handler(); // 让 LVGL 把刚才的改动画出来

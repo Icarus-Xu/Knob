@@ -1,25 +1,33 @@
-// 独立 BLE HID 测试固件：只验证 ESP32-S3 能不能被手机/车机识别成蓝牙键盘、
-// 配对连接后按键事件能不能真的送达。不依赖屏幕、不依赖编码器。
+// 独立 BLE 测试固件：验证 ESP32-S3 能不能被手机/车机配对连接，配对
+// 加密建立后按键事件通知和显示同步写入两条自定义特征值能不能正常工作。
+// 不依赖屏幕、不依赖编码器。
 // 编译烧录：pio run -e test_ble -t upload -t monitor
 //
-// 用法：烧录后在手机/车机的蓝牙设置里找到 "Knob-XXXX"（后 4 位是该板子
-// 蓝牙 MAC 的后 2 字节，每块板子不一样）并配对连接，配对方式是 Passkey
-// （数字比对）：ESP32 和手机会各自显示一个 6 位数，串口和手机弹窗上应该
-// 是同一个数字，确认一致后在手机上点确认即可，不需要输入。连上之后每隔
-// 2 秒会交替发送一次左/右方向键——找一个能看到光标或者输入框的地方
-// （比如手机记事本 App、电脑文本编辑器），确认真的收到了按键。
+// 用法：烧录后用 nRF Connect 连上 "Knob-XXXX"（后 4 位是该板子蓝牙 MAC
+// 的后 2 字节，每块板子不一样），配对方式是 Passkey（数字比对）：ESP32
+// 和手机会各自显示一个 6 位数，串口和手机弹窗上应该是同一个数字，确认
+// 一致后在手机上点确认即可，不需要输入。
 //
-// 顺带验证 ble_on_display_update()：用 nRF Connect 连上后，找到自定义
-// 服务（29afa70d-...）下面的可写特征值（5f774e59-...），写 3 字节
-// 比如 "00 16 00"（module=0, value=0x0016=22），串口应该打出
-// "[TestBLE] display update: module=0 value=22"。
+// 验证按键事件通知（29afa70d-... 服务下 182f303d-... 特征值）：在
+// nRF Connect 里对这个特征值点"订阅"（Enable Notifications），连上后
+// 每隔 2 秒会交替通知一次左/右方向键，应该能在 nRF Connect 里看到收到
+// 的 2 字节数据交替变化（21,0 / 22,0，小端 int16 的 KEYCODE_DPAD_LEFT/
+// RIGHT），串口也会打印发送日志。
+//
+// 顺带验证 ble_on_display_update()：找到同一服务下的可写特征值
+// （5f774e59-...），写 9 字节 "05 76 61 6C 75 65 00 16 00"——这是通用
+// 键值对编码里的一条 entry：keyLen=5, key="value"(76 61 6C 75 65),
+// type=0(int16), 值=0x0016=22（小端）。串口应该打出
+// "[BLE] display update: 1 fields" + "  value=22"，然后
+// "[TestBLE] display update: 1 fields, value=22"。
+// 完整格式（多个 entry、string/bool 类型）见 ble.h 里 DisplayData 的注释。
 
 #include <Arduino.h>
 #include "ble.h"
-#include <HijelHID_BLEKeyboard.h> // KEY_LEFT / KEY_RIGHT 常量
 
-static void on_display_update(uint8_t module, int16_t value) {
-    Serial.printf("[TestBLE] display update: module=%u value=%d\n", module, value);
+static void on_display_update(const DisplayData &data) {
+    Serial.printf("[TestBLE] display update: %d fields, value=%d\n",
+                  data.count, data.getInt("value"));
 }
 
 void setup() {
@@ -44,11 +52,11 @@ void loop() {
     if (paired && millis() - last_send_ms >= 2000) {
         last_send_ms = millis();
         if (send_left) {
-            Serial.println("[TestBLE] tap LEFT");
-            ble_tap(KEY_LEFT);
+            Serial.println("[TestBLE] send DPAD_LEFT");
+            ble_send_key(KEYCODE_DPAD_LEFT);
         } else {
-            Serial.println("[TestBLE] tap RIGHT");
-            ble_tap(KEY_RIGHT);
+            Serial.println("[TestBLE] send DPAD_RIGHT");
+            ble_send_key(KEYCODE_DPAD_RIGHT);
         }
         send_left = !send_left;
     }
