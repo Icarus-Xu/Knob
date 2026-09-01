@@ -2,34 +2,73 @@
 #include "config.h"
 #include <Arduino.h>
 
-// --- 旋转方向：正交解码 ---
+// --- 旋转方向：正交解码（整步状态机） ---
 //
 // EC11 内部有 A、B 两路开关，机械结构上错开了一点，所以转动旋钮时
-// 它们不会同时触发。靠它们"谁先变"就能判断方向：
-//   顺时针：  A、B 按 00 -> 01 -> 11 -> 10 -> 00 ... 的顺序变化
-//   逆时针：  顺序正好反过来
+// 它们不会同时触发。靠它们"谁先变"就能判断方向。
 //
-// QUAD_TABLE 的下标是"上一次的 2 位状态 + 这一次的 2 位状态"拼成的
-// 4 位数（一共 16 种组合），查出来的值就是这一次跳变对应的 -1/0/+1。
-// 这是很成熟、被广泛验证过的"整步"解码表——比单纯看某一个引脚的
-// 边沿去猜方向要抗干扰得多。
-static const int8_t QUAD_TABLE[16] = {
-    0, -1, 1, 0,
-    1, 0, 0, -1,
-    -1, 0, 0, 1,
-    0, 1, -1, 0,
+// 最早用的是纯查表累加（每次电平跳变都按 -1/0/+1 计一票，攒够 4 的
+// 倍数才除出一步，不够的余数留到下次），实测换向的第一下经常没反应：
+// EC11 停留的机械档位和电气触点真正闭合的位置之间有点空程
+// （backlash），换向瞬间第一下往往凑不够 4 次跳变，会被"除以 4 向零
+// 截断"直接吃掉，要转第二下才会跟前一次的余数一起报出来，表现成
+// "丢了一格"。
+//
+// 换成半步状态机（Ben Buxton 那版）试过之后发现变成一跳两格——半步
+// 状态机把电平 00 和 11 都当成合法的静止起点，而这颗 EC11 实测是标准
+// 的"整步"编码器（一档 4 次跳变，只在 00 这一个状态真正停留），走一
+// 档会经过两段半步、各报一次，所以翻倍了。
+//
+// 这里换成 Buxton 同一套思路里对应"整步"编码器的版本：同样是状态机、
+// 只有跳变序列真的按合法顺序走完一整圈、回到静止状态 R_START 才确认
+// 一步，不是简单累加跳变次数再除——换向时哪怕空程更明显，状态机也
+// 只会在中间状态之间来回摆动、安全地退回 R_START，不会把没走完的
+// 那部分平白攒成误报，也不会像最早那版"除以 4 截断"一样把它吞掉。
+// 每个物理档位还是只报 1 步，手感灵敏度跟最早的版本一致。
+enum : uint8_t {
+    R_START = 0x0,
+    R_CW_FINAL = 0x1,
+    R_CW_BEGIN = 0x2,
+    R_CW_NEXT = 0x3,
+    R_CCW_BEGIN = 0x4,
+    R_CCW_FINAL = 0x5,
+    R_CCW_NEXT = 0x6,
+};
+enum : uint8_t {
+    DIR_CW = 0x10,
+    DIR_CCW = 0x20,
+    DIR_MASK = 0x30,
 };
 
-static volatile uint8_t s_quad_state = 0;   // 最近一次 A/B 读数，用作查表下标
-static volatile int32_t s_enc_accum = 0;    // 原始跳变计数；4 次跳变 = 转过 1 个物理档位
+// 下标 [当前状态（去掉方向标志位）][这次读到的 2 位 A/B 电平]，查出来
+// 的新状态只有在真正转完一整圈回到 R_START 的那一下才会带上
+// DIR_CW/DIR_CCW 标志，用来驱动 s_enc_accum。
+static const uint8_t FULL_STEP_TABLE[7][4] = {
+    /* R_START     */ {R_START,     R_CW_BEGIN,  R_CCW_BEGIN, R_START},
+    /* R_CW_FINAL  */ {R_CW_NEXT,   R_START,     R_CW_FINAL,  R_START | DIR_CW},
+    /* R_CW_BEGIN  */ {R_CW_NEXT,   R_CW_BEGIN,  R_START,     R_START},
+    /* R_CW_NEXT   */ {R_CW_NEXT,   R_CW_BEGIN,  R_CW_FINAL,  R_START},
+    /* R_CCW_BEGIN */ {R_CCW_NEXT,  R_START,     R_CCW_BEGIN, R_START},
+    /* R_CCW_FINAL */ {R_CCW_NEXT,  R_CCW_FINAL, R_START,     R_START | DIR_CCW},
+    /* R_CCW_NEXT  */ {R_CCW_NEXT,  R_CCW_FINAL, R_CCW_BEGIN, R_START},
+};
+
+static volatile uint8_t s_state = R_START;
+static volatile int32_t s_enc_accum = 0; // 已确认的档位数，方向状态机直接累加，不用再除
 
 // 这个函数会在 A 或 B 每次电平变化时触发，运行在中断优先级——
 // 要写得尽量短，绝对不能在里面调用 Serial.print 这类耗时的操作。
 void IRAM_ATTR encoder_isr() {
     uint8_t a = digitalRead(ENC_PIN_A);
     uint8_t b = digitalRead(ENC_PIN_B);
-    s_quad_state = ((s_quad_state << 2) | (a << 1) | b) & 0x0F;
-    s_enc_accum += QUAD_TABLE[s_quad_state];
+    uint8_t pinstate = (a << 1) | b;
+    s_state = FULL_STEP_TABLE[s_state & 0x0F][pinstate];
+    uint8_t dir = s_state & DIR_MASK;
+    if (dir == DIR_CW) {
+        s_enc_accum++;
+    } else if (dir == DIR_CCW) {
+        s_enc_accum--;
+    }
 }
 
 void encoder_init() {
@@ -42,15 +81,12 @@ void encoder_init() {
 }
 
 int16_t encoder_get_diff() {
-    // 常见的 EC11 转一档（一次"咔哒"手感）对应 4 次正交跳变。
-    // 如果你手上这颗转起来感觉要转两下才动一格，说明它一档只有
-    // 2 次跳变——把下面的 /4 改成 /2 即可。
+    // 状态机已经在 ISR 里按"确认完成一步"才累加，s_enc_accum 本身
+    // 就是档位数，这里直接算差值，不用再除。
     static int32_t last_reported = 0;
     int32_t accum = s_enc_accum; // volatile 读取；函数执行过程中 ISR 可能改它，没关系
-    int16_t steps = (int16_t)((accum - last_reported) / 4);
-    if (steps != 0) {
-        last_reported += (int32_t)steps * 4;
-    }
+    int16_t steps = (int16_t)(accum - last_reported);
+    last_reported = accum;
     return steps;
 }
 
