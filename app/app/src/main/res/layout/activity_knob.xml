@@ -119,6 +119,17 @@
                     android:layout_marginTop="2dp" />
             </LinearLayout>
         </LinearLayout>
+
+        <!-- 临时调试按钮：验证 BleManager 能不能把数据写给 knob（第 2 步用，
+             跑通后再决定要不要留） -->
+        <Button
+            android:id="@+id/btnTestBleWrite"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="🔧 测试 BLE 写入 (module=0 value=22)"
+            android:textSize="11sp"
+            android:textAllCaps="false" />
     </LinearLayout>
 
     <!-- ==================== 右列：插件页面容器（未加载时显示占位符） ==================== -->
