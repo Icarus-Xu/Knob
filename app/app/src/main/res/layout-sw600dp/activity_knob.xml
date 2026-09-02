@@ -1,28 +1,238 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 默认布局：手机竖屏（也是没有其它限定符能命中时的兜底，包括折叠屏
-     折起来的窄屏）。上下堆叠，插件容器拿大头空间（权重 7），日志/按钮
-     这个开发调试面板缩到下面一小块（权重 3），日志区自己再滚动。
-     另一份变体：
-       layout-sw600dp/   大屏（车机宽屏、折叠屏展开后，不管方向）：
-                         左右分栏，跟这份用的是同一套 view id/控件类型，
-                         ViewBinding 才能共用同一个 ActivityKnobBinding，
-                         KnobActivity.kt 不用为不同屏幕分别写代码。
-                         折叠屏展开后哪怕还是竖屏方向，只要最小宽度
-                         >=600dp 就会优先命中它而不是这份——sw600dp
-                         这个尺寸限定符比方向限定符优先级更高。
-     改这份文件时留意 layout-sw600dp 是不是也要跟着改。 -->
+<!-- 大屏（sw>=600dp：车机宽屏、折叠屏展开后）版布局：左右分栏，插件
+     容器在右边。默认的 layout/activity_knob.xml 是手机竖屏（上下堆叠），
+     单独建这份文件是为了让大屏设备（不管方向）都走这套横向分栏，
+     不会命中默认那份手机布局——折叠屏展开后哪怕还是竖屏方向，也会
+     优先命中这份，因为 sw600dp 这个尺寸限定符比方向限定符优先级高。
+     跟默认布局用的是同一套 view id/控件类型，改这份文件时留意
+     layout/activity_knob.xml 是不是也要跟着改（目前项目规模小，两份
+     布局各自独立维护，先接受这点重复）。 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
+    android:orientation="horizontal"
     android:padding="8dp">
 
-    <!-- ==================== 上：插件页面容器（未加载时显示占位符） ==================== -->
+    <!-- ==================== 左列：日志（上方）+ 按钮（底部） ==================== -->
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:orientation="vertical"
+        android:paddingEnd="8dp">
+
+        <!-- 日志区（占满左列上部） -->
+        <TextView
+            android:id="@+id/tvLog"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:background="#F5F5F5"
+            android:textColor="#1A1A1A"
+            android:textColorHighlight="#4D4D4D"
+            android:padding="8dp"
+            android:scrollbars="vertical"
+            android:gravity="top" />
+
+        <!-- 按钮区：三个可爱 emoji 大按钮（日志下方） -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingTop="6dp">
+
+            <LinearLayout
+                android:id="@+id/btnPickPlugin"
+                android:layout_width="0dp"
+                android:layout_height="88dp"
+                android:layout_weight="1"
+                android:layout_marginEnd="4dp"
+                android:background="@drawable/bg_btn_blue"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackground"
+                android:gravity="center"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="📥"
+                    android:textSize="38sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="选择插件"
+                    android:textSize="11sp"
+                    android:textColor="#1565C0"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/btnClearLog"
+                android:layout_width="0dp"
+                android:layout_height="88dp"
+                android:layout_weight="1"
+                android:layout_marginEnd="4dp"
+                android:background="@drawable/bg_btn_orange"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackground"
+                android:gravity="center"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="🧹"
+                    android:textSize="38sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="清空日志"
+                    android:textSize="11sp"
+                    android:textColor="#E65100"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/btnSaveLog"
+                android:layout_width="0dp"
+                android:layout_height="88dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_btn_green"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackground"
+                android:gravity="center"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="💾"
+                    android:textSize="38sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="保存日志"
+                    android:textSize="11sp"
+                    android:textColor="#2E7D32"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- 权限申请：每个权限单独一个按键，不在启动时自动弹——车机上
+             不知道自动弹权限会不会引发奇怪的系统行为，改成用户手动点。
+             风格跟上面「选择插件」那排一致（圆角色块+图标+文字），颜色
+             随权限状态变化：没授权=红色可点，已授权=绿色不可点（见
+             KnobActivity.updatePermButtonState）。 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginTop="6dp">
+
+            <LinearLayout
+                android:id="@+id/btnReqAcCommon"
+                android:layout_width="0dp"
+                android:layout_height="72dp"
+                android:layout_weight="1"
+                android:layout_marginEnd="4dp"
+                android:background="@drawable/bg_btn_red"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackground"
+                android:gravity="center"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="🌡️"
+                    android:textSize="26sp" />
+
+                <TextView
+                    android:id="@+id/tvReqAcCommonLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="AC_COMMON"
+                    android:textSize="10sp"
+                    android:textColor="#C62828"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/btnReqSettingCommon"
+                android:layout_width="0dp"
+                android:layout_height="72dp"
+                android:layout_weight="1"
+                android:layout_marginEnd="4dp"
+                android:background="@drawable/bg_btn_red"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackground"
+                android:gravity="center"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="⚙️"
+                    android:textSize="26sp" />
+
+                <TextView
+                    android:id="@+id/tvReqSettingCommonLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="SETTING_COMMON"
+                    android:textSize="10sp"
+                    android:textColor="#C62828"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/btnReqBluetooth"
+                android:layout_width="0dp"
+                android:layout_height="72dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_btn_red"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackground"
+                android:gravity="center"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="📶"
+                    android:textSize="26sp" />
+
+                <TextView
+                    android:id="@+id/tvReqBluetoothLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="蓝牙权限"
+                    android:textSize="10sp"
+                    android:textColor="#C62828"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- ==================== 右列：插件页面容器（未加载时显示占位符） ==================== -->
     <FrameLayout
         android:id="@+id/pluginContainer"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="7"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
         android:background="#FFFFFF">
 
         <!-- 占位符：插件 bindContainer 渲染时会 removeAllViews 清掉它 -->
@@ -56,215 +266,4 @@
                 android:layout_marginTop="6dp" />
         </LinearLayout>
     </FrameLayout>
-
-    <!-- ==================== 下：日志 + 按钮（开发调试面板） ==================== -->
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="3"
-        android:orientation="vertical"
-        android:paddingTop="8dp">
-
-        <!-- 日志区（占满调试面板的剩余高度，自己滚动） -->
-        <TextView
-            android:id="@+id/tvLog"
-            android:layout_width="match_parent"
-            android:layout_height="0dp"
-            android:layout_weight="1"
-            android:textSize="12sp"
-            android:fontFamily="monospace"
-            android:textIsSelectable="true"
-            android:background="#F5F5F5"
-            android:textColor="#1A1A1A"
-            android:textColorHighlight="#4D4D4D"
-            android:padding="8dp"
-            android:scrollbars="vertical"
-            android:gravity="top" />
-
-        <!-- 按钮区：三个可爱 emoji 大按钮 -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:paddingTop="6dp">
-
-            <LinearLayout
-                android:id="@+id/btnPickPlugin"
-                android:layout_width="0dp"
-                android:layout_height="72dp"
-                android:layout_weight="1"
-                android:layout_marginEnd="4dp"
-                android:background="@drawable/bg_btn_blue"
-                android:clickable="true"
-                android:focusable="true"
-                android:foreground="?attr/selectableItemBackground"
-                android:gravity="center"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="📥"
-                    android:textSize="30sp" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="选择插件"
-                    android:textSize="11sp"
-                    android:textColor="#1565C0"
-                    android:layout_marginTop="2dp" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:id="@+id/btnClearLog"
-                android:layout_width="0dp"
-                android:layout_height="72dp"
-                android:layout_weight="1"
-                android:layout_marginEnd="4dp"
-                android:background="@drawable/bg_btn_orange"
-                android:clickable="true"
-                android:focusable="true"
-                android:foreground="?attr/selectableItemBackground"
-                android:gravity="center"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="🧹"
-                    android:textSize="30sp" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="清空日志"
-                    android:textSize="11sp"
-                    android:textColor="#E65100"
-                    android:layout_marginTop="2dp" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:id="@+id/btnSaveLog"
-                android:layout_width="0dp"
-                android:layout_height="72dp"
-                android:layout_weight="1"
-                android:background="@drawable/bg_btn_green"
-                android:clickable="true"
-                android:focusable="true"
-                android:foreground="?attr/selectableItemBackground"
-                android:gravity="center"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="💾"
-                    android:textSize="30sp" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="保存日志"
-                    android:textSize="11sp"
-                    android:textColor="#2E7D32"
-                    android:layout_marginTop="2dp" />
-            </LinearLayout>
-        </LinearLayout>
-
-        <!-- 权限申请：风格跟上面一致，颜色随权限状态变化（见
-             KnobActivity.updatePermButtonState）。 -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:layout_marginTop="6dp">
-
-            <LinearLayout
-                android:id="@+id/btnReqAcCommon"
-                android:layout_width="0dp"
-                android:layout_height="60dp"
-                android:layout_weight="1"
-                android:layout_marginEnd="4dp"
-                android:background="@drawable/bg_btn_red"
-                android:clickable="true"
-                android:focusable="true"
-                android:foreground="?attr/selectableItemBackground"
-                android:gravity="center"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="🌡️"
-                    android:textSize="22sp" />
-
-                <TextView
-                    android:id="@+id/tvReqAcCommonLabel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="AC_COMMON"
-                    android:textSize="10sp"
-                    android:textColor="#C62828"
-                    android:layout_marginTop="2dp" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:id="@+id/btnReqSettingCommon"
-                android:layout_width="0dp"
-                android:layout_height="60dp"
-                android:layout_weight="1"
-                android:layout_marginEnd="4dp"
-                android:background="@drawable/bg_btn_red"
-                android:clickable="true"
-                android:focusable="true"
-                android:foreground="?attr/selectableItemBackground"
-                android:gravity="center"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="⚙️"
-                    android:textSize="22sp" />
-
-                <TextView
-                    android:id="@+id/tvReqSettingCommonLabel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="SETTING_COMMON"
-                    android:textSize="10sp"
-                    android:textColor="#C62828"
-                    android:layout_marginTop="2dp" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:id="@+id/btnReqBluetooth"
-                android:layout_width="0dp"
-                android:layout_height="60dp"
-                android:layout_weight="1"
-                android:background="@drawable/bg_btn_red"
-                android:clickable="true"
-                android:focusable="true"
-                android:foreground="?attr/selectableItemBackground"
-                android:gravity="center"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="📶"
-                    android:textSize="22sp" />
-
-                <TextView
-                    android:id="@+id/tvReqBluetoothLabel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="蓝牙权限"
-                    android:textSize="10sp"
-                    android:textColor="#C62828"
-                    android:layout_marginTop="2dp" />
-            </LinearLayout>
-        </LinearLayout>
-    </LinearLayout>
 </LinearLayout>
