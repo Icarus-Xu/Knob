@@ -4,20 +4,19 @@
 // LVGL 从来不会直接往屏幕上画，它先画到这块内存缓冲区里，
 // 画完一块区域后再交给下面的 disp_flush_cb() —— 整个工程里
 // 只有这个函数真正跟硬件打交道。40 行缓冲在动画流畅度和内存
-// 占用（240*40*2 字节）之间是个还不错的折中。
-static lv_disp_draw_buf_t draw_buf;
-static lv_color_t buf1[CONFIG_SCREEN_HOR_RES * 40];
-static lv_disp_drv_t disp_drv;
+// 占用（240*40*2 字节，RGB565 每像素 2 字节）之间是个还不错的折中。
+static uint8_t buf1[CONFIG_SCREEN_HOR_RES * 40 * 2];
 static SCREEN_CLASS *screen;
 
 // LVGL 每画完一块矩形区域的像素就会调这个回调。area 是这块矩形的
-// 位置和大小，color_p 是像素数据。我们只是把它转发给 Arduino_GFX
-// 驱动去真正显示，再告诉 LVGL"画完了，这块缓冲你可以回收了"。
-static void disp_flush_cb(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+// 位置和大小，px_map 是像素数据——display_init() 里把颜色格式设成了
+// RGB565_SWAPPED（大端字节序），跟 Arduino_GFX 的 draw16bitBeRGBBitmap
+// 要的字节序一致，直接转过去用就行，不用自己再转一次字节序。
+static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     uint32_t w = area->x2 - area->x1 + 1;
     uint32_t h = area->y2 - area->y1 + 1;
-    screen->draw16bitBeRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
-    lv_disp_flush_ready(disp);
+    screen->draw16bitBeRGBBitmap(area->x1, area->y1, (uint16_t *)px_map, w, h);
+    lv_display_flush_ready(disp);
 }
 
 void display_init() {
@@ -32,14 +31,16 @@ void display_init() {
 
     // 2) 初始化 LVGL，并告诉它怎么找到刚才点亮的这块屏幕。
     lv_init();
-    lv_disp_draw_buf_init(&draw_buf, buf1, NULL, CONFIG_SCREEN_HOR_RES * 40);
-
-    lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = CONFIG_SCREEN_HOR_RES;
-    disp_drv.ver_res = CONFIG_SCREEN_VER_RES;
-    disp_drv.flush_cb = disp_flush_cb;
-    disp_drv.draw_buf = &draw_buf;
-    lv_disp_drv_register(&disp_drv);
+    // 之前 v8 时代靠 lv_conf.h 里的 LV_TICK_CUSTOM 配置生效；v9 把它
+    // 改成了运行时注册回调，millis() 的签名（uint32_t(*)(void)）正好
+    // 跟 lv_tick_get_cb_t 对上，直接传函数指针就行，不用包一层。
+    lv_tick_set_cb(millis);
+    lv_display_t *disp = lv_display_create(CONFIG_SCREEN_HOR_RES, CONFIG_SCREEN_VER_RES);
+    // 之前 v8 时代靠 lv_conf.h 里的 LV_COLOR_16_SWAP=1 全局生效；v9 把
+    // 这个字节序改成了按每个 display 单独设置的颜色格式，效果一样。
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
+    lv_display_set_buffers(disp, buf1, NULL, sizeof(buf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(disp, disp_flush_cb);
 }
 
 void display_task_handler() {
