@@ -70,3 +70,40 @@ struct DisplayData {
 // data 指向的是内部一块复用的缓冲区，只在回调期间有效，getString()
 // 返回的指针也是——需要长期保留的话必须自己复制一份，不能只存指针。
 void ble_on_display_update(void (*callback)(const DisplayData &data));
+
+// ==================== 配对/连接状态回调（main.cpp 用来同步屏幕显示） ====================
+
+// 正在配对时，手机和固件两边应该显示同一个 6 位确认码，注册这个回调
+// 把这个码显示在屏幕上，方便用户核对屏幕上和手机上是不是同一个数字。
+// 只有真正走一次新配对流程时才会触发；已配对过的设备重连不会再走
+// 这一步（直接用之前保存的密钥重新加密，见 ble_on_paired）。
+void ble_on_passkey(void (*callback)(uint32_t passkey));
+
+// 加密连接建立成功时触发一次——不管这次是刚刚走完配对流程，还是用
+// 已保存的密钥重新连接（重连不会再触发 ble_on_passkey），main.cpp
+// 用它切到"配对成功"提示。
+void ble_on_paired(void (*callback)());
+
+// 断开连接时触发（不管之前有没有配对成功过），main.cpp 用它把屏幕
+// 切回"未连接"状态。
+void ble_on_disconnected(void (*callback)());
+
+// 这块 knob 广播出去的蓝牙名字（"Knob-XXXX" 格式，XXXX 是芯片蓝牙 MAC
+// 后 2 字节，见 ble.cpp 的 build_device_name）。ble_init() 调用之后才
+// 有效——main.cpp 在"从没配对过"这种状态下用它提示"去手机蓝牙设置里
+// 找这个名字配对"（同时配好几个 knob 时，只有这个提示才能分清楚具体
+// 是哪一个还没配对）。
+const char *ble_get_device_name();
+
+// 这块 knob 有没有跟任何设备配对成功过——这是存在 ESP32 自己 flash 里
+// 的本地状态（NimBLE 的 bond store），不需要问手机就能查，主要用来
+// 区分"从没配对过"（要提示用户去配对）和"配对过、只是暂时断连"（等
+// 它自动重连就行，不用管），main.cpp 靠这个决定未连接时该显示什么。
+bool ble_has_any_bond();
+
+// 清空 ESP32 自己保存的所有配对记录（不影响手机那边——手机的配对
+// 记录得去手机蓝牙设置里单独删）。主要是给开发调试用：手机端解绑
+// 之后 ESP32 这边并不会跟着清掉记录（两边各自独立存储，没有自动
+// 同步机制），如果想真的测试"从没配对过"这条路径，得手动调这个——
+// 见 main.cpp 里长按 BOOT 键触发的逻辑。
+void ble_clear_all_bonds();

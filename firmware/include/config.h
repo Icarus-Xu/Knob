@@ -30,3 +30,12 @@
 #define ENC_PIN_SW 6   // 按键，按下时接地（用内部上拉电阻）
 
 #define ENC_LONG_PRESS_MS 800  // 按住多久算"长按"
+
+// --- 开发板自带的 BOOT 键 ---
+// 接的是 GPIO0，同时也是"要不要进下载模式"的启动选脚——只有在
+// 开机/复位那一瞬间被拉低才会进下载模式，设备已经正常跑起来之后
+// 再按它就是个普通输入，不影响运行，所以只能在运行期间（不是开机
+// 瞬间）拿它当调试用的按键，见 main.cpp 的"长按清除配对信息"。
+#define BOOT_BTN_PIN 0
+#define BOOT_BTN_CLEAR_BONDS_MS 5000     // 长按多久触发清除配对信息
+#define BOOT_BTN_PROGRESS_START_MS 2000  // 按住多久开始显示红色进度环（不是一按下就显示）

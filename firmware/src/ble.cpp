@@ -21,16 +21,23 @@ static DisplayData s_display_data;
 static volatile bool s_connected = false;
 static volatile bool s_authenticated = false;
 
+static void (*s_passkey_cb)(uint32_t passkey) = nullptr;
+static void (*s_paired_cb)() = nullptr;
+static void (*s_disconnected_cb)() = nullptr;
+
+// 广播用的设备名，ble_init() 里算出来存这儿——main.cpp 未连接时要在
+// 屏幕上提示"去手机蓝牙设置里找这个名字"，需要在 ble_init() 之后随时
+// 能读到，不能只是 ble_init() 内部一个局部变量。
+static char s_device_name[16] = "";
+
 // 多块板子刷同一份固件时，蓝牙名字不能都叫一样——名字只是给人看的、
 // 蓝牙协议本身认设备靠地址和密钥，不会真的连错，但人在手机配对列表里
 // 认名字，一堆同名设备很容易手滑点错。这里在名字后面拼上芯片蓝牙 MAC
 // 地址的后 2 字节，让每块板子广播出来的名字都不一样。
-static String build_device_name() {
+static void build_device_name() {
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_BT); // 出厂烧录的蓝牙 MAC，不依赖 BLE 栈已初始化
-    char suffix[5];
-    snprintf(suffix, sizeof(suffix), "%02X%02X", mac[4], mac[5]);
-    return String("Knob-") + suffix;
+    snprintf(s_device_name, sizeof(s_device_name), "Knob-%02X%02X", mac[4], mac[5]);
 }
 
 // 通用键值对解码：壳（BleManager）编码时完全不理解字段含义，格式是
@@ -127,10 +134,10 @@ class DisplayUpdateCallbacks : public NimBLECharacteristicCallbacks {
 };
 static DisplayUpdateCallbacks s_display_update_callbacks;
 
-// 连接/配对生命周期。ESP32 这边没有屏幕能显示数字比对的确认弹窗（严格说
-// 有屏幕，但没接进配对流程里），配对时自动确认自己这一侧——真正的人工
-// 核对靠人去比串口打印的 6 位数和手机弹窗上的是不是一样，跟接 HID 键盘
-// 那版行为一致，没有削弱安全性，只是没有强制要求人去核对。
+// 连接/配对生命周期。配对时自动确认自己这一侧（不等物理按键），真正的
+// 人工核对靠人去比屏幕（见 ble_on_passkey，main.cpp 会显示这个码）和
+// 串口打印的 6 位数是不是跟手机弹窗上的一样，没有削弱安全性，只是没有
+// 强制要求人去核对。
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override {
         s_connected = true;
@@ -151,25 +158,34 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         s_authenticated = false;
         Serial.printf("[BLE] host disconnected (reason=%d), restarting advertising\n", reason);
         NimBLEDevice::startAdvertising();
+        if (s_disconnected_cb != nullptr) {
+            s_disconnected_cb();
+        }
     }
 
     void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
         s_authenticated = connInfo.isEncrypted();
         Serial.println(s_authenticated ? "[BLE] pairing succeeded" : "[BLE] pairing failed");
+        if (s_authenticated && s_paired_cb != nullptr) {
+            s_paired_cb();
+        }
     }
 
     void onConfirmPassKey(NimBLEConnInfo &connInfo, uint32_t pass_key) override {
         Serial.printf("[BLE] passkey: %06u (should match what the phone shows)\n", pass_key);
+        if (s_passkey_cb != nullptr) {
+            s_passkey_cb(pass_key);
+        }
         NimBLEDevice::injectConfirmPasskey(connInfo, true);
     }
 };
 static ServerCallbacks s_server_callbacks;
 
 void ble_init() {
-    String device_name = build_device_name();
-    Serial.printf("[BLE] initializing as \"%s\"...\n", device_name.c_str());
+    build_device_name();
+    Serial.printf("[BLE] initializing as \"%s\"...\n", s_device_name);
 
-    NimBLEDevice::init(device_name.c_str());
+    NimBLEDevice::init(s_device_name);
 
     // Arduino-ESP32 3.x + NimBLE-Arduino 2.5.1 上 init() 之后 NimBLE host
     // 任务需要一点时间才真正就绪，太早配置安全参数/建 server 会失败。
@@ -196,10 +212,19 @@ void ble_init() {
 
     NimBLEService *service = server->createService(kServiceUUID);
 
-    s_key_event_char = service->createCharacteristic(kKeyEventCharUUID, NIMBLE_PROPERTY::NOTIFY);
+    // 两个特征值都带上 *_ENC，要求访问前链路必须是加密的——之前没加，
+    // ATT 层从来没强制要求加密，导致杀 App 重启后手机重新 connectGatt()
+    // 时，只要不碰会要求加密的操作，蓝牙栈完全没必要重新走一遍加密
+    // 流程，onAuthenticationComplete() 就不会再触发，s_authenticated
+    // 一直卡在 false，knob 屏幕卡在"等待配对"（其实链路是通的，只是
+    // 没加密，knob 这边认为没配对成功）。加上这两个 flag 后，每次
+    // 重连手机都得先重新建立加密才能读写这两个特征值，onAuthentication
+    // Complete() 也就能保证每个连接周期都至少触发一次。
+    s_key_event_char = service->createCharacteristic(
+        kKeyEventCharUUID, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_ENC);
 
-    NimBLECharacteristic *displayChar =
-        service->createCharacteristic(kDisplayCharUUID, NIMBLE_PROPERTY::WRITE);
+    NimBLECharacteristic *displayChar = service->createCharacteristic(
+        kDisplayCharUUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     displayChar->setCallbacks(&s_display_update_callbacks);
 
     server->start();
@@ -207,11 +232,33 @@ void ble_init() {
     NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
     adv->addServiceUUID(kServiceUUID);
     NimBLEAdvertisementData scanResponse;
-    scanResponse.setName(device_name.c_str());
+    scanResponse.setName(s_device_name);
     adv->setScanResponseData(scanResponse);
     NimBLEDevice::startAdvertising();
 
-    Serial.printf("[BLE] advertising as \"%s\"\n", device_name.c_str());
+    Serial.printf("[BLE] advertising as \"%s\"\n", s_device_name);
+}
+
+const char *ble_get_device_name() {
+    return s_device_name;
+}
+
+bool ble_has_any_bond() {
+    return NimBLEDevice::getNumBonds() > 0;
+}
+
+void ble_clear_all_bonds() {
+    // 配对时我们让手机分发了 IRK（setSecurityInitKey/RespKey 里的
+    // BLE_SM_PAIR_KEY_DIST_ID），NimBLE 删配对记录时要连带把 IRK 从
+    // "地址解析列表"里也摘掉，这个操作在广播中是不允许做的——
+    // ble_gap_unpair() 一看 ble_gap_adv_active()==true 就直接返回
+    // BLE_HS_EBUSY，删除失败。而 knob 只要没连接就一直在广播（见
+    // ServerCallbacks::onDisconnect 和 ble_init() 末尾），所以之前
+    // 不管什么时候按都会失败。这里先停广播、删完再重新广播。
+    NimBLEDevice::stopAdvertising();
+    bool ok = NimBLEDevice::deleteAllBonds();
+    NimBLEDevice::startAdvertising();
+    Serial.printf("[BLE] clear all bonds: %s\n", ok ? "ok" : "failed");
 }
 
 bool ble_is_paired() {
@@ -251,4 +298,16 @@ void ble_send_key_with_value(int16_t keycode, int16_t value) {
 
 void ble_on_display_update(void (*callback)(const DisplayData &data)) {
     s_display_update_cb = callback;
+}
+
+void ble_on_passkey(void (*callback)(uint32_t passkey)) {
+    s_passkey_cb = callback;
+}
+
+void ble_on_paired(void (*callback)()) {
+    s_paired_cb = callback;
+}
+
+void ble_on_disconnected(void (*callback)()) {
+    s_disconnected_cb = callback;
 }

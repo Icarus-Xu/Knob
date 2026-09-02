@@ -22,3 +22,8 @@ bool encoder_take_click();
 // 和 encoder_take_click() 类似，但对应按住超过
 // ENC_LONG_PRESS_MS 的长按。
 bool encoder_take_long_press();
+
+// 直接读一次按键当前是不是按着（不经过消抖/长短按判定）。给开机时
+// "按住按键几秒钟触发清除配对信息"这种一次性检测用——那时候只关心
+// "这一刻按没按着"，不需要 encoder_poll_button() 那一整套状态机。
+bool encoder_is_button_pressed();

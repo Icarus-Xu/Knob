@@ -142,3 +142,7 @@ bool encoder_take_long_press() {
     }
     return false;
 }
+
+bool encoder_is_button_pressed() {
+    return digitalRead(ENC_PIN_SW) == LOW; // 接线是按下时低电平（上拉），跟 encoder_poll_button() 一致
+}
