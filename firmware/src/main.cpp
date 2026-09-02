@@ -174,6 +174,14 @@ static void redraw_normal() {
     snprintf(buf, sizeof(buf), "%d", s_value);
     lv_label_set_text(s_label_value, buf);
 
+    // BOOT 长按清除配对那个红色进度环（见 draw_reset_progress）会把
+    // s_arc 的背景角度/起始角度改成画满一整圈，这两行改回正常显示数值
+    // 时的样子（留 90 度缺口）——不然长按过一次 BOOT 键之后，空调/座椅
+    // 这些正常页面的圆弧就会一直保持成整圈，回不去了。跟 build_ui() 里
+    // 的初始值保持一致。
+    lv_arc_set_rotation(s_arc, 135);
+    lv_arc_set_bg_angles(s_arc, 0, 270);
+
     if (s_max > s_min) {
         lv_arc_set_range(s_arc, s_min, s_max);
         // min<0（比如座椅 -2~2，0=关闭居中）用 LVGL 内置的对称模式：
