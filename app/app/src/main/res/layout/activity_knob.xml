@@ -121,55 +121,102 @@
         </LinearLayout>
 
         <!-- 权限申请：每个权限单独一个按键，不在启动时自动弹——车机上
-             不知道自动弹权限会不会引发奇怪的系统行为，改成用户手动点。 -->
+             不知道自动弹权限会不会引发奇怪的系统行为，改成用户手动点。
+             风格跟上面「选择插件」那排一致（圆角色块+图标+文字），颜色
+             随权限状态变化：没授权=红色可点，已授权=绿色不可点（见
+             KnobActivity.updatePermButtonState）。 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:layout_marginTop="6dp">
 
-            <Button
+            <LinearLayout
                 android:id="@+id/btnReqAcCommon"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
+                android:layout_height="72dp"
                 android:layout_weight="1"
-                android:layout_marginEnd="2dp"
-                android:text="申请 AC_COMMON"
-                android:textSize="10sp"
-                android:textAllCaps="false" />
+                android:layout_marginEnd="4dp"
+                android:background="@drawable/bg_btn_red"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackground"
+                android:gravity="center"
+                android:orientation="vertical">
 
-            <Button
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="🌡️"
+                    android:textSize="26sp" />
+
+                <TextView
+                    android:id="@+id/tvReqAcCommonLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="AC_COMMON"
+                    android:textSize="10sp"
+                    android:textColor="#C62828"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+
+            <LinearLayout
                 android:id="@+id/btnReqSettingCommon"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
+                android:layout_height="72dp"
                 android:layout_weight="1"
-                android:layout_marginStart="2dp"
-                android:layout_marginEnd="2dp"
-                android:text="申请 SETTING_COMMON"
-                android:textSize="10sp"
-                android:textAllCaps="false" />
+                android:layout_marginEnd="4dp"
+                android:background="@drawable/bg_btn_red"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackground"
+                android:gravity="center"
+                android:orientation="vertical">
 
-            <Button
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="⚙️"
+                    android:textSize="26sp" />
+
+                <TextView
+                    android:id="@+id/tvReqSettingCommonLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="SETTING_COMMON"
+                    android:textSize="10sp"
+                    android:textColor="#C62828"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+
+            <LinearLayout
                 android:id="@+id/btnReqBluetooth"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
+                android:layout_height="72dp"
                 android:layout_weight="1"
-                android:layout_marginStart="2dp"
-                android:text="申请蓝牙权限"
-                android:textSize="10sp"
-                android:textAllCaps="false" />
-        </LinearLayout>
+                android:background="@drawable/bg_btn_red"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackground"
+                android:gravity="center"
+                android:orientation="vertical">
 
-        <!-- 临时调试按钮：验证 BleManager 能不能把数据写给 knob（第 2 步用，
-             跑通后再决定要不要留） -->
-        <Button
-            android:id="@+id/btnTestBleWrite"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:text="🔧 测试 BLE 写入 (标题/值/范围)"
-            android:textSize="11sp"
-            android:textAllCaps="false" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="📶"
+                    android:textSize="26sp" />
+
+                <TextView
+                    android:id="@+id/tvReqBluetoothLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="蓝牙权限"
+                    android:textSize="10sp"
+                    android:textColor="#C62828"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+        </LinearLayout>
     </LinearLayout>
 
     <!-- ==================== 右列：插件页面容器（未加载时显示占位符） ==================== -->

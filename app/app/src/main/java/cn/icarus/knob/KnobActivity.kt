@@ -2,6 +2,8 @@ package cn.icarus.knob
 
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -9,6 +11,8 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.view.KeyEvent
 import android.view.WindowManager
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -72,14 +76,6 @@ class KnobActivity : AppCompatActivity() {
         }
         binding.btnClearLog.setOnClickListener { LogSink.clear() }
         binding.btnSaveLog.setOnClickListener { saveLog() }
-        binding.btnTestBleWrite.setOnClickListener {
-            // 万一之前 init() 时设备还没配对，这里顺手再触发一次
-            // （已经连上的话 init() 内部会直接跳过，不会有副作用）。
-            BleManager.init(applicationContext)
-            val testData = mapOf("title" to "测试", "value" to 22, "min" to 17, "max" to 33)
-            val sent = BleManager.write(testData)
-            LogSink.append(if (sent) "[测试] BleManager.write($testData) 已发送" else "[测试] BleManager.write($testData) 失败（GATT 未就绪）")
-        }
 
         // 权限申请不在启动时自动弹——每个权限单独一个按键，用户手动点了
         // 才请求。之前试过在 onResume() 里自动发起，在某些设备上 onResume()
@@ -88,6 +84,7 @@ class KnobActivity : AppCompatActivity() {
         binding.btnReqAcCommon.setOnClickListener { requestSinglePermission("android.permission.BYDAUTO_AC_COMMON", REQUEST_AC_COMMON_PERM) }
         binding.btnReqSettingCommon.setOnClickListener { requestSinglePermission("android.permission.BYDAUTO_SETTING_COMMON", REQUEST_SETTING_COMMON_PERM) }
         binding.btnReqBluetooth.setOnClickListener { requestBluetoothPermissionAndConnect() }
+        refreshPermButtonStates()
 
         // 插件已在 Application.onCreate 同步加载完，这里把页面容器交给它
         bindPluginUi()
@@ -255,6 +252,7 @@ class KnobActivity : AppCompatActivity() {
         }
         if (checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED) {
             LogSink.append("✅ 已经是授权状态")
+            refreshPermButtonStates()
             return
         }
         requestPermissions(arrayOf(perm), requestCode)
@@ -279,6 +277,43 @@ class KnobActivity : AppCompatActivity() {
                 if (granted) BleManager.init(applicationContext)
             }
         }
+        refreshPermButtonStates()
+    }
+
+    // ==================== 权限按钮的红/绿状态 ====================
+
+    /**
+     * 按当前实际权限状态刷新三个权限按钮的颜色：没授权=红色可点，已
+     * 授权=绿色不可点（授权之后没有"撤销"这个操作，不可点直接表达
+     * "已经完成，不用再管了"）。跟上面「选择插件」那排按钮同一套圆角
+     * 色块+图标+文字风格。
+     */
+    private fun refreshPermButtonStates() {
+        val acGranted = checkSelfPermission("android.permission.BYDAUTO_AC_COMMON") == PackageManager.PERMISSION_GRANTED
+        updatePermButtonState(binding.btnReqAcCommon, binding.tvReqAcCommonLabel, acGranted)
+
+        val settingGranted = checkSelfPermission("android.permission.BYDAUTO_SETTING_COMMON") == PackageManager.PERMISSION_GRANTED
+        updatePermButtonState(binding.btnReqSettingCommon, binding.tvReqSettingCommonLabel, settingGranted)
+
+        val bleGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        updatePermButtonState(binding.btnReqBluetooth, binding.tvReqBluetoothLabel, bleGranted)
+    }
+
+    private fun updatePermButtonState(container: LinearLayout, label: TextView, granted: Boolean) {
+        container.setBackgroundResource(if (granted) R.drawable.bg_btn_green else R.drawable.bg_btn_red)
+        label.setTextColor(Color.parseColor(if (granted) "#2E7D32" else "#C62828"))
+        container.isClickable = !granted
+        container.isFocusable = !granted
+        container.foreground = if (granted) null else selectableItemForeground()
+    }
+
+    /** 每次都取一份新的 ?attr/selectableItemBackground drawable，不同 View 不能共用同一个实例（内部状态会互相打架）。 */
+    private fun selectableItemForeground(): Drawable? {
+        val ta = obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackground))
+        val drawable = ta.getDrawable(0)
+        ta.recycle()
+        return drawable
     }
 
     // ==================== 蓝牙权限 + GATT 连接 ====================
@@ -300,6 +335,7 @@ class KnobActivity : AppCompatActivity() {
         if (granted) {
             LogSink.append("✅ BLUETOOTH_CONNECT 已授权")
             BleManager.init(applicationContext)
+            refreshPermButtonStates()
         } else {
             LogSink.append("请求 BLUETOOTH_CONNECT 权限")
             requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT), REQUEST_BLUETOOTH_PERM)
