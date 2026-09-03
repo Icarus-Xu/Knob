@@ -22,7 +22,10 @@ static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
 void display_init() {
     // 1) 先把物理屏幕通过 SPI 点亮。
     Arduino_DataBus *bus = new Arduino_HWSPI(TFT_DC, TFT_CS, TFT_SCLK, TFT_MOSI, TFT_MISO);
-    screen = new SCREEN_CLASS(bus, TFT_RST, /*rotation=*/2, /*IPS=*/true);
+    // rotation 是 0~3，每个值对应实际转 90 度，要跟屏幕的物理装配方向
+    // 匹配才能让画面正着显示——屏幕物理装反了 180 度，这里就得 +2
+    // （mod 4）补回来，跟上一版比是从 2 改成了 0。
+    screen = new SCREEN_CLASS(bus, TFT_RST, /*rotation=*/0, /*IPS=*/true);
     screen->begin();
     screen->fillScreen(RGB565_BLACK);
 

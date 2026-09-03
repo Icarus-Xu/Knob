@@ -15,7 +15,7 @@ void setup() {
     Serial.println("[TestDisplay] boot");
 
     Arduino_DataBus *bus = new Arduino_HWSPI(TFT_DC, TFT_CS, TFT_SCLK, TFT_MOSI, TFT_MISO);
-    screen = new Arduino_GC9A01(bus, TFT_RST, /*rotation=*/2, /*IPS=*/true);
+    screen = new Arduino_GC9A01(bus, TFT_RST, /*rotation=*/0, /*IPS=*/true);
     screen->begin();
 
     pinMode(TFT_BLK, OUTPUT);
