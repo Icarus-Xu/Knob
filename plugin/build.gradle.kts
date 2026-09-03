@@ -15,11 +15,32 @@ val androidJar = System.getenv("ANDROID_HOME")?.let { "$it/platforms/android-34/
 val d8Path = System.getenv("ANDROID_HOME")?.let { "$it/build-tools/36.1.0/d8" }
     ?: "/home/icarus/Android/Sdk/build-tools/36.1.0/d8"
 
+// 两份构建变体，共用 src/main/kotlin 里的全部插件代码，只有
+// SIMULATE_CAR_CONTROL 这一个值不一样（各自一份 BuildFlags.kt，见
+// src/main/flags-real 和 src/main/flags-simulate）：
+//   main（默认 source set）    + flags-real      → plugin.dex           真实车控
+//   simulate（新增 source set）+ flags-simulate  → plugin-simulate.dex  本地模拟，不碰真车
+// 不用手改 SIMULATE_CAR_CONTROL 的值来回切换重新编译，一次构建两份都出。
+sourceSets {
+    main {
+        kotlin.srcDir("src/main/flags-real/kotlin")
+    }
+    create("simulate") {
+        kotlin.srcDir("src/main/kotlin")
+        kotlin.srcDir("src/main/flags-simulate/kotlin")
+    }
+}
+
 dependencies {
     // android.jar：编译 Context 等 Android 类
     compileOnly(files(androidJar))
     // 车机厂商官方车控 SDK（仅编译用，运行时由车机系统提供）
     compileOnly(files("libs/bydauto-openapi.jar"))
+
+    // simulate source set 是新建的，不会自动继承上面这两个 compileOnly——
+    // 同样的编译期依赖再给它配一份。
+    "simulateCompileOnly"(files(androidJar))
+    "simulateCompileOnly"(files("libs/bydauto-openapi.jar"))
 }
 
 // 不使用强制 toolchain：让 Kotlin 直接用 Gradle 当前运行的 JDK 编译（本机环境）。
@@ -27,6 +48,7 @@ dependencies {
 // 关键：java 和 kotlin 的 JVM-target 必须一致（否则 Gradle 报
 // "Inconsistent JVM-target compatibility"）。这里都设为 17 —— 只是字节码目标，
 // 不是编译 JDK 版本，所以无论 Gradle 用 JDK 21 还是 25 都能编译。
+// 这两个设置是项目级默认值，main/simulate 两个 source set 的编译任务都适用。
 
 java {
     sourceCompatibility = JavaVersion.VERSION_17
@@ -39,7 +61,55 @@ kotlin {
     }
 }
 
-// 打包所有类到单个 jar（不含 android.jar，因为 compileOnly）
+// 把 jar 转成 dex 的公共逻辑（main/simulate 两个变体共用，避免重复写
+// 一遍 d8 调用 + JAVA_HOME/PATH 处理）。两个变体最终都落在同一个
+// output/ 目录里（plugin.dex 和 plugin-simulate.dex 并排放），所以
+// d8 自己的中间产物（它固定叫 classes.dex）不能直接写到 output/ 里，
+// 也不能每次都把 output/ 整个删了重建——否则先跑完的那个变体的 dex
+// 会被后跑的那个变体启动时删掉。d8 先写到各自独立的临时目录，
+// 再把结果拷贝改名进共享的 output/ 目录。
+fun runD8(jarFile: File, finalOutDir: File, dexFileName: String) {
+    val tmpDir = file("build/d8-tmp-$dexFileName")
+    tmpDir.deleteRecursively()
+    tmpDir.mkdirs()
+
+    val d8 = File(d8Path)
+    if (!d8.exists()) {
+        throw GradleException("d8 不存在: $d8Path，请检查 ANDROID_HOME")
+    }
+    val cmd = listOf(
+        d8.absolutePath,
+        "--output", tmpDir.absolutePath,
+        "--lib", androidJar,
+        jarFile.absolutePath
+    )
+    // d8 是 shell 脚本，靠 JAVA_HOME/PATH 找 java。
+    // 这里用 Gradle 当前运行 JVM 的 java，不写死任何 JDK 路径，完全跟随本机环境。
+    val javaHome = System.getProperty("java.home") // 例如 .../jbr 或 .../jdk-21
+    val javaBin = File(javaHome, "bin").absolutePath
+    val pb = ProcessBuilder(cmd)
+    val env = pb.environment()
+    env["JAVA_HOME"] = javaHome
+    env["PATH"] = "$javaBin${File.pathSeparator}${env["PATH"] ?: ""}"
+    pb.redirectErrorStream(true)
+    val process = pb.start()
+    val output = process.inputStream.readBytes().toString(Charsets.UTF_8)
+    val exit = process.waitFor()
+    if (exit != 0) {
+        throw GradleException("d8 转换失败:\n$output")
+    }
+
+    val classesDex = File(tmpDir, "classes.dex")
+    if (!classesDex.exists()) {
+        throw GradleException("未找到 classes.dex")
+    }
+    finalOutDir.mkdirs()
+    classesDex.copyTo(File(finalOutDir, dexFileName), overwrite = true)
+    println("✅ $dexFileName 生成: ${File(finalOutDir, dexFileName).absolutePath}")
+}
+
+// ==================== 真实车控变体：main → plugin.dex ====================
+
 tasks.register<Jar>("pluginJar") {
     archiveFileName.set("plugin.jar")
     from(sourceSets["main"].output)
@@ -47,52 +117,37 @@ tasks.register<Jar>("pluginJar") {
     dependsOn("compileKotlin")
 }
 
-// 一步完成 jar → dex（方案 B：Android Studio 里双击 pluginDex 即得 plugin.dex）
 tasks.register("pluginDex") {
     group = "knob"
-    description = "编译插件并转成 plugin.dex"
+    description = "编译插件（真实车控）并转成 plugin.dex"
     dependsOn("pluginJar")
-
     doLast {
-        val jarFile = file("build/libs/plugin.jar")
-        val outDir = file("output")
-        outDir.deleteRecursively()
-        outDir.mkdirs()
-
-        // 用 d8 把 jar 转成 dex
-        val d8 = file(d8Path)
-        if (!d8.exists()) {
-            throw GradleException("d8 不存在: $d8Path，请检查 ANDROID_HOME")
-        }
-        val cmd = listOf(
-            d8.absolutePath,
-            "--output", outDir.absolutePath,
-            "--lib", androidJar,
-            jarFile.absolutePath
-        )
-        // d8 是 shell 脚本，靠 JAVA_HOME/PATH 找 java。
-        // 这里用 Gradle 当前运行 JVM 的 java，不写死任何 JDK 路径，完全跟随本机环境。
-        val javaHome = System.getProperty("java.home") // 例如 .../jbr 或 .../jdk-21
-        val javaBin = File(javaHome, "bin").absolutePath
-        val pb = ProcessBuilder(cmd)
-        val env = pb.environment()
-        env["JAVA_HOME"] = javaHome
-        env["PATH"] = "$javaBin${File.pathSeparator}${env["PATH"] ?: ""}"
-        pb.redirectErrorStream(true)
-        val process = pb.start()
-        val output = process.inputStream.readBytes().toString(Charsets.UTF_8)
-        val exit = process.waitFor()
-        if (exit != 0) {
-            throw GradleException("d8 转换失败:\n$output")
-        }
-
-        // 重命名为 plugin.dex
-        val classesDex = file("output/classes.dex")
-        if (classesDex.exists()) {
-            classesDex.copyTo(file("output/plugin.dex"), overwrite = true)
-            println("✅ plugin.dex 生成: ${file("output/plugin.dex").absolutePath}")
-        } else {
-            throw GradleException("未找到 classes.dex")
-        }
+        runD8(file("build/libs/plugin.jar"), file("output"), "plugin.dex")
     }
+}
+
+// ==================== 模拟变体：simulate → plugin-simulate.dex ====================
+
+tasks.register<Jar>("pluginJarSimulate") {
+    archiveFileName.set("plugin-simulate.jar")
+    from(sourceSets["simulate"].output)
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    dependsOn("compileSimulateKotlin")
+}
+
+tasks.register("pluginDexSimulate") {
+    group = "knob"
+    description = "编译插件（本地模拟，不碰真车）并转成 plugin-simulate.dex"
+    dependsOn("pluginJarSimulate")
+    doLast {
+        runD8(file("build/libs/plugin-simulate.jar"), file("output"), "plugin-simulate.dex")
+    }
+}
+
+// ==================== 一次构建两份 ====================
+
+tasks.register("pluginDexAll") {
+    group = "knob"
+    description = "一次构建出 plugin.dex（真实车控）和 plugin-simulate.dex（本地模拟）"
+    dependsOn("pluginDex", "pluginDexSimulate")
 }

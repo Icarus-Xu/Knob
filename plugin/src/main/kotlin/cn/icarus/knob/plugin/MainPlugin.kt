@@ -25,11 +25,11 @@ import cn.icarus.knob.api.Ui
 class MainPlugin : KnobPlugin {
 
     companion object {
-        // 先不签名，验证按键/GATT/插件路由这条完整链路时不碰真实车控接口
-        // ——BYDAUTO_*_GET/SET 没有签名拿不到，调了也只会拿到失败/异常，
-        // 干扰链路验证。等签名装上真车机测试时把这个改成 false 就切回
-        // 真实调用，其余代码不用动。
-        private const val SIMULATE_CAR_CONTROL = true
+        // SIMULATE_CAR_CONTROL 不在这里定义——两份构建变体（build.gradle.kts
+        // 的 main/simulate 两个 source set）各自带一份 BuildFlags.kt，
+        // 编译期就把值定死，一次构建同时出 plugin.dex（false，真实车控）
+        // 和 plugin-simulate.dex（true，本地模拟，不碰真车，验证按键/
+        // GATT/插件路由这条链路用），不用手动改这一个值来回切换重新编译。
 
         private const val PREFS_NAME = "knob_plugin_state"
         private const val KEY_PAGE = "page"
