@@ -1,6 +1,8 @@
 package cn.icarus.knob.plugin
 
 import android.content.Context
+import android.hardware.bydauto.ac.BYDAutoAcDevice
+import android.hardware.bydauto.setting.BYDAutoSettingDevice
 import cn.icarus.knob.api.KnobHost
 
 /**
@@ -42,23 +44,23 @@ class PluginSelfTest(
         run("初始化 AC 设备") { if (!control.initAcDevice(context)) throw RuntimeException("失败"); "ok" }
 
         // 座椅通风
-        run("座椅通风-低档") { control.setDriverSeatVentilating(context, CarControl.SEAT_VENTILATING_LOW)?.toString() ?: throw RuntimeException("null") }
-        run("座椅通风-高档") { control.setDriverSeatVentilating(context, CarControl.SEAT_VENTILATING_HIGH)?.toString() ?: throw RuntimeException("null") }
-        run("座椅通风-关闭") { control.setDriverSeatVentilating(context, CarControl.SEAT_VENTILATING_OFF)?.toString() ?: throw RuntimeException("null") }
+        run("座椅通风-低档") { control.setDriverSeatVentilating(context, BYDAutoSettingDevice.SEAT_VENTILATING_LOW)?.toString() ?: throw RuntimeException("null") }
+        run("座椅通风-高档") { control.setDriverSeatVentilating(context, BYDAutoSettingDevice.SEAT_VENTILATING_HIGH)?.toString() ?: throw RuntimeException("null") }
+        run("座椅通风-关闭") { control.setDriverSeatVentilating(context, BYDAutoSettingDevice.SEAT_VENTILATING_OFF)?.toString() ?: throw RuntimeException("null") }
         run("读座椅通风状态") { control.getDriverSeatVentilating(context)?.toString() ?: throw RuntimeException("null") }
 
         // 空调温度
-        val temps = listOf(CarControl.AC_TEMP_CELSIUS_MIN, 22, CarControl.AC_TEMP_CELSIUS_MAX)
+        val temps = listOf(BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, 22, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
         temps.forEach { t ->
-            run("空调主驾 ${t}°C") { control.setAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN, t)?.toString() ?: throw RuntimeException("null") }
+            run("空调主驾 ${t}°C") { control.setAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_MAIN, t)?.toString() ?: throw RuntimeException("null") }
         }
-        run("空调副驾 22°C") { control.setAcTemperature(context, CarControl.AC_TEMPERATURE_DEPUTY, 22)?.toString() ?: throw RuntimeException("null") }
-        run("空调后排 22°C") { control.setAcTemperature(context, CarControl.AC_TEMPERATURE_REAR, 22)?.toString() ?: throw RuntimeException("null") }
-        run("空调主副联动 22°C") { control.setAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN_DEPUTY, 22)?.toString() ?: throw RuntimeException("null") }
+        run("空调副驾 22°C") { control.setAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_DEPUTY, 22)?.toString() ?: throw RuntimeException("null") }
+        run("空调后排 22°C") { control.setAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_REAR, 22)?.toString() ?: throw RuntimeException("null") }
+        run("空调主副联动 22°C") { control.setAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY, 22)?.toString() ?: throw RuntimeException("null") }
         listOf(
-            CarControl.AC_TEMPERATURE_MAIN to "主驾",
-            CarControl.AC_TEMPERATURE_DEPUTY to "副驾",
-            CarControl.AC_TEMPERATURE_REAR to "后排"
+            BYDAutoAcDevice.AC_TEMPERATURE_MAIN to "主驾",
+            BYDAutoAcDevice.AC_TEMPERATURE_DEPUTY to "副驾",
+            BYDAutoAcDevice.AC_TEMPERATURE_REAR to "后排"
         ).forEach { (area, label) ->
             run("读空调$label 温度") { control.getAcTemperature(context, area)?.toString() ?: throw RuntimeException("null") }
         }
@@ -78,10 +80,10 @@ class PluginSelfTest(
         run("空调开关-关闭") { control.setAcPower(context, false)?.toString() ?: throw RuntimeException("null") }
 
         // 异常温度边界
-        run("异常温度-16°C") { control.setAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN, 16)?.toString() ?: throw RuntimeException("null") }
-        run("异常温度-34°C") { control.setAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN, 34)?.toString() ?: throw RuntimeException("null") }
-        run("异常温度--5°C") { control.setAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN, -5)?.toString() ?: throw RuntimeException("null") }
-        run("异常温度-99°C") { control.setAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN, 99)?.toString() ?: throw RuntimeException("null") }
+        run("异常温度-16°C") { control.setAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_MAIN, 16)?.toString() ?: throw RuntimeException("null") }
+        run("异常温度-34°C") { control.setAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_MAIN, 34)?.toString() ?: throw RuntimeException("null") }
+        run("异常温度--5°C") { control.setAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_MAIN, -5)?.toString() ?: throw RuntimeException("null") }
+        run("异常温度-99°C") { control.setAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_MAIN, 99)?.toString() ?: throw RuntimeException("null") }
 
         out("🏁 自检完成：通过 $pass 项，失败 $fail 项")
         _lastResult = sb.toString()

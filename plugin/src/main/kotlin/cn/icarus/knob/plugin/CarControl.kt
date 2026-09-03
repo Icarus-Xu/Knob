@@ -3,7 +3,10 @@ package cn.icarus.knob.plugin
 import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.IBYDAutoDevice
+import android.hardware.bydauto.ac.AbsBYDAutoAcListener
 import android.hardware.bydauto.ac.BYDAutoAcDevice
+import android.hardware.bydauto.sensor.AbsBYDAutoSensorListener
+import android.hardware.bydauto.sensor.BYDAutoSensorDevice
 import android.hardware.bydauto.setting.BYDAutoSettingDevice
 import cn.icarus.knob.api.KnobHost
 import java.io.PrintWriter
@@ -20,35 +23,29 @@ import java.lang.reflect.Method
  */
 class CarControl(private val logger: KnobHost) {
 
-    // ---- 座椅常量 ----
-    companion object {
-        const val DRIVER_SEAT = 1
-        const val PASSENGER_SEAT = 2
-        const val SEAT_VENTILATING_OFF = 1
-        const val SEAT_VENTILATING_LOW = 2
-        const val SEAT_VENTILATING_HIGH = 3
-
-        // ---- 空调常量（官方 BYDAutoAcDevice）----
-        const val AC_TEMPERATURE_MAIN = 1
-        const val AC_TEMPERATURE_DEPUTY = 2
-        const val AC_TEMPERATURE_REAR = 3
-        const val AC_TEMPERATURE_MAIN_DEPUTY = 0
-        const val AC_TEMPERATURE_UNIT_OC = 1
-        const val AC_TEMP_CELSIUS_MIN = 17
-        const val AC_TEMP_CELSIUS_MAX = 33
-
-        const val AC_CTRL_SOURCE_UI_KEY = 0
-
-        const val AC_COMMAND_SUCCESS = 0
-
-        const val AC_TEMPCTRL_SEPARATE_OFF = 0
-        const val AC_TEMPCTRL_SEPARATE_ON = 1
-    }
-
     private var settingDevice: BYDAutoSettingDevice? = null
     private var acDevice: BYDAutoAcDevice? = null
+    private var sensorDevice: BYDAutoSensorDevice? = null
+
+    // 外部（MainPlugin）想在这些值被语音/按键等车机自身渠道改了之后
+    // 实时收到通知，就设这两个回调——CarControl 自己只管注册/解析监听器，
+    // 不知道 vehicleState/UI 这些插件内部状态，所以用回调往外传，不直接
+    // 依赖 MainPlugin。回调是在 AIDL 监听器的回调线程上触发的，不是主
+    // 线程，MainPlugin 那边要自己切回主线程才能碰 View/knob 同步。
+    var onTemperatureChangedExternal: ((area: Int, value: Int) -> Unit)? = null
+    var onLightIntensityChangedExternal: ((level: Int) -> Unit)? = null
 
     fun log(msg: String) = logger.log(msg)
+
+    /** 打日志时把整数值的十进制和十六进制都打出来，方便排查"数值看着像溢出/哨兵值"这种问题
+     *（比如 Int.MIN_VALUE 十进制是一长串不好一眼认出来，十六进制 0x80000000 就很明显）。 */
+    private fun logIntValue(label: String, value: Int?) {
+        if (value == null) {
+            log("  $label = null")
+        } else {
+            log("  $label = $value (0x${value.toUInt().toString(16)})")
+        }
+    }
 
     private fun enableDevice(context: Context, device: IBYDAutoDevice, logName: String) {
         try {
@@ -128,7 +125,7 @@ class CarControl(private val logger: KnobHost) {
         if (settingDevice == null && !initSettingDevice(context)) return null
         return try {
             val method = findMethod(settingDevice!!, "setSeatVentilatingState", Int::class.java, Int::class.java)
-            val result = method.invoke(settingDevice, DRIVER_SEAT, state) as? Int
+            val result = method.invoke(settingDevice, BYDAutoSettingDevice.DRIVER_SEAT, state) as? Int
             log("▶ 主驾座椅通风 → 档位=$state，返回码=$result (0=成功)")
             result
         } catch (e: Throwable) {
@@ -141,8 +138,9 @@ class CarControl(private val logger: KnobHost) {
         if (settingDevice == null && !initSettingDevice(context)) return null
         return try {
             val method = findMethod(settingDevice!!, "getSeatVentilatingState", Int::class.java)
-            val result = method.invoke(settingDevice, DRIVER_SEAT) as? Int
-            log("◀ 主驾座椅通风状态 = $result (1=关,2=低,3=高)")
+            val result = method.invoke(settingDevice, BYDAutoSettingDevice.DRIVER_SEAT) as? Int
+            log("◀ 主驾座椅通风状态 (1=关,2=低,3=高)")
+            logIntValue("result", result)
             result
         } catch (e: Throwable) {
             log("⚠️ 读取座椅通风状态失败: ${e.message}")
@@ -150,7 +148,86 @@ class CarControl(private val logger: KnobHost) {
         }
     }
 
+    /**
+     * 反射列举 BYDAutoSettingDevice 上的全部方法（含未公开的），不按名字筛选——
+     * 官方常量里已经有 FEATURE_DRIVER_SEAT_HEATING 等 4 个座椅加热/通风的
+     * feature 常量，猜测应该有配套的隐藏方法，但方法名不一定跟 Seat/Heat/Vent
+     * 这几个词对得上，干脆全部打出来自己看。只打印方法签名，不调用。
+     */
+    fun probeSeatFeatureMethods(context: Context) {
+        if (settingDevice == null && !initSettingDevice(context)) return
+        val cls = settingDevice!!.javaClass
+        log("🔍 反射扫描 ${cls.name} 上的全部方法（只看不调）：")
+        val methods = (cls.declaredMethods.toList() + cls.methods.toList())
+            .distinctBy { m -> "${m.name}(${m.parameterTypes.joinToString(",") { it.name }})" }
+            .sortedBy { it.name }
+        methods.forEach { m ->
+            val mod = java.lang.reflect.Modifier.toString(m.modifiers)
+            val params = m.parameterTypes.joinToString(", ") { it.simpleName }
+            log("  [$mod] ${m.name}($params): ${m.returnType.simpleName}")
+        }
+    }
+
+    /**
+     * 用官方 hasFeature(String) + BYDAutoSettingDevice.FEATURE_DRIVER_SEAT_HEATING
+     * 等 4 个官方常量查一下座椅加热/通风在这台车机上是否配置为支持
+     * （1=支持，0=不支持），确认是车机配置问题还是接口本身的问题。
+     */
+    fun checkSeatFeatures(context: Context) {
+        if (settingDevice == null && !initSettingDevice(context)) return
+        log("🔍 座椅加热/通风 feature 配置检查：")
+        val features = listOf(
+            "主驾加热" to BYDAutoSettingDevice.FEATURE_DRIVER_SEAT_HEATING,
+            "主驾通风" to BYDAutoSettingDevice.FEATURE_DRIVER_SEAT_VENTILATING,
+            "副驾加热" to BYDAutoSettingDevice.FEATURE_PASSENGER_SEAT_HEATING,
+            "副驾通风" to BYDAutoSettingDevice.FEATURE_PASSENGER_SEAT_VENTILATING,
+        )
+        features.forEach { (label, feature) ->
+            try {
+                val r = settingDevice!!.hasFeature(feature)
+                log("  $label ($feature) = $r (1=支持,0=不支持)")
+            } catch (e: Throwable) {
+                log("  ⚠️ $label ($feature) 查询失败: ${e.message}")
+            }
+        }
+    }
+
     // ==================== 空调 ====================
+
+    // AC 的各种状态变化监听——只有 onTemperatureChanged 这一个有对应的外部
+    // 回调（onTemperatureChangedExternal，MainPlugin 用来实时同步温度），
+    // 其它回调目前插件内没有对应的状态/UI 可更新，先只打日志留痕，不往外
+    // 传。注意：分控（AcTemperatureControlMode）变化没有专门的监听回调
+    // （文档和反编译的 SDK 桩里都没有），这几个回调覆盖不到分控被语音/
+    // 按键从外部改的情况，目前不处理。
+    // 曾经尝试过覆写 IBYDAutoListener 唯一的 onDataChanged（猜测是所有
+    // onXxxChanged 具名回调的通用分发源头，可能覆盖分控这种没有专门回调
+    // 的字段），但真机加载插件时报 LinkageError：AbsBYDAutoAcListener 上
+    // 这个方法实际是 final 的（编译期用的 bydauto-openapi.jar 桩包没标出
+    // 这一点），框架就是故意锁死不让子类覆写，逼着用具名回调，这条路走
+    // 不通，不要再加。
+    private val acListener = object : AbsBYDAutoAcListener() {
+        override fun onTemperatureChanged(area: Int, value: Int) {
+            log("🔔 [AC监听] 温度变化 area=${areaLabel(area)} value=$value")
+            onTemperatureChangedExternal?.invoke(area, value)
+        }
+        override fun onAcStarted() = log("🔔 [AC监听] 空调开启")
+        override fun onAcStoped() = log("🔔 [AC监听] 空调关闭")
+        override fun onAcRearStarted() = log("🔔 [AC监听] 后排空调开启")
+        override fun onAcRearStoped() = log("🔔 [AC监听] 后排空调关闭")
+        override fun onAcCtrlModeChanged(mode: Int) = log("🔔 [AC监听] 控制方式(手动/自动)变化 mode=$mode")
+        override fun onAcCycleModeChanged(mode: Int) = log("🔔 [AC监听] 循环方式变化 mode=$mode")
+        override fun onAcVentilationStateChanged(state: Int) = log("🔔 [AC监听] 驻车通风变化 state=$state")
+        override fun onAcDefrostStateChanged(area: Int, state: Int) = log("🔔 [AC监听] 除霜变化 area=$area state=$state")
+        override fun onAcCompressorManualSignChanged(sign: Int) = log("🔔 [AC监听] 压缩机手动标志变化 sign=$sign")
+        override fun onAcCompressorModeChanged(mode: Int) = log("🔔 [AC监听] 压缩机状态变化 mode=$mode")
+        override fun onAcWindModeManualSignChanged(sign: Int) = log("🔔 [AC监听] 出风模式手动标志变化 sign=$sign")
+        override fun onAcWindModeChanged(mode: Int) = log("🔔 [AC监听] 出风模式变化 mode=$mode")
+        override fun onAcWindLevelManualSignChanged(sign: Int) = log("🔔 [AC监听] 风量手动标志变化 sign=$sign")
+        override fun onAcWindLevelChanged(level: Int) = log("🔔 [AC监听] 风量变化 level=$level")
+        override fun onTemperatureUnitChanged(unit: Int) = log("🔔 [AC监听] 温度单位变化 unit=$unit")
+        override fun onAcWindModeShownStateChanged(state: Int) = log("🔔 [AC监听] 出风模式显示状态变化 state=$state")
+    }
 
     fun initAcDevice(context: Context): Boolean {
         return try {
@@ -161,6 +238,8 @@ class CarControl(private val logger: KnobHost) {
             }
             log("✅ 获取 BYDAutoAcDevice 实例成功")
             enableDevice(context, acDevice!!, "AC 设备")
+            acDevice!!.registerListener(acListener)
+            log("✅ 已注册 AC 监听器")
             true
         } catch (e: Throwable) {
             log("❌ 初始化 AC 设备失败: ${e.javaClass.simpleName} - ${e.message}")
@@ -168,11 +247,18 @@ class CarControl(private val logger: KnobHost) {
         }
     }
 
+    /** 插件销毁时清理，避免监听器继续挂在已经不用的插件实例上。 */
+    fun unregisterListeners() {
+        try { acDevice?.unregisterListener(acListener) } catch (e: Throwable) { log("⚠️ 取消 AC 监听器失败: ${e.message}") }
+        try { sensorDevice?.unregisterListener(sensorListener) } catch (e: Throwable) { log("⚠️ 取消 Sensor 监听器失败: ${e.message}") }
+    }
+
     fun setAcTemperature(context: Context, area: Int, value: Int): Int? {
         if (acDevice == null && !initAcDevice(context)) return null
         return try {
-            val result = acDevice!!.setAcTemperature(area, value, AC_CTRL_SOURCE_UI_KEY, AC_TEMPERATURE_UNIT_OC)
-            log("▶ 空调(${areaLabel(area)}) → 温度=${value}°C，返回码=$result")
+            val result = acDevice!!.setAcTemperature(area, value, BYDAutoAcDevice.AC_CTRL_SOURCE_UI_KEY, BYDAutoAcDevice.AC_TEMPERATURE_UNIT_OC)
+            log("▶ 空调(${areaLabel(area)}) → 温度=${value}°C")
+            logIntValue("返回码", result)
             result
         } catch (e: Throwable) {
             log("❌ setAcTemperature 调用失败:\n${exceptionDetail(e)}")
@@ -182,10 +268,11 @@ class CarControl(private val logger: KnobHost) {
 
     fun setAcTemperatureControlMode(context: Context, separate: Boolean): Int? {
         if (acDevice == null && !initAcDevice(context)) return null
-        val mode = if (separate) AC_TEMPCTRL_SEPARATE_ON else AC_TEMPCTRL_SEPARATE_OFF
+        val mode = if (separate) BYDAutoAcDevice.AC_TEMPCTRL_SEPARATE_ON else BYDAutoAcDevice.AC_TEMPCTRL_SEPARATE_OFF
         return try {
-            val result = acDevice!!.setAcTemperatureControlMode(AC_CTRL_SOURCE_UI_KEY, mode)
-            log("▶ 分控=${if (separate) "开启" else "关闭"}，返回码=$result")
+            log("▶ 分控 setAcTemperatureControlMode(setSource=${BYDAutoAcDevice.AC_CTRL_SOURCE_UI_KEY}, mode=$mode) [${if (separate) "开启" else "关闭"}]")
+            val result = acDevice!!.setAcTemperatureControlMode(BYDAutoAcDevice.AC_CTRL_SOURCE_UI_KEY, mode)
+            logIntValue("返回码", result)
             result
         } catch (e: Throwable) {
             log("❌ setAcTemperatureControlMode 调用失败:\n${exceptionDetail(e)}")
@@ -196,8 +283,9 @@ class CarControl(private val logger: KnobHost) {
     fun getAcTemperatureControlMode(context: Context): Int? {
         if (acDevice == null && !initAcDevice(context)) return null
         return try {
+            log("◀ 分控 getAcTemperatureControlMode() (${BYDAutoAcDevice.AC_TEMPCTRL_SEPARATE_OFF}=关,${BYDAutoAcDevice.AC_TEMPCTRL_SEPARATE_ON}=开)")
             val result = acDevice!!.getAcTemperatureControlMode()
-            log("◀ 空调分控模式 = $result ($AC_TEMPCTRL_SEPARATE_OFF=关,$AC_TEMPCTRL_SEPARATE_ON=开)")
+            logIntValue("result", result)
             result
         } catch (e: Throwable) {
             log("⚠️ 读取分控模式失败: ${e.message}")
@@ -208,8 +296,8 @@ class CarControl(private val logger: KnobHost) {
     fun setAcPower(context: Context, on: Boolean): Int? {
         if (acDevice == null && !initAcDevice(context)) return null
         return try {
-            val result = if (on) acDevice!!.start(AC_CTRL_SOURCE_UI_KEY)
-                          else acDevice!!.stop(AC_CTRL_SOURCE_UI_KEY)
+            val result = if (on) acDevice!!.start(BYDAutoAcDevice.AC_CTRL_SOURCE_UI_KEY)
+                          else acDevice!!.stop(BYDAutoAcDevice.AC_CTRL_SOURCE_UI_KEY)
             log("▶ 空调${if (on) "开启" else "关闭"}，返回码=$result")
             result
         } catch (e: Throwable) {
@@ -221,7 +309,7 @@ class CarControl(private val logger: KnobHost) {
     fun setAcWindLevel(context: Context, level: Int): Int? {
         if (acDevice == null && !initAcDevice(context)) return null
         return try {
-            val result = acDevice!!.setAcWindLevel(AC_CTRL_SOURCE_UI_KEY, level)
+            val result = acDevice!!.setAcWindLevel(BYDAutoAcDevice.AC_CTRL_SOURCE_UI_KEY, level)
             log("▶ 空调风量=$level，返回码=$result")
             result
         } catch (e: Throwable) {
@@ -233,7 +321,7 @@ class CarControl(private val logger: KnobHost) {
     fun setAcWindMode(context: Context, mode: Int): Int? {
         if (acDevice == null && !initAcDevice(context)) return null
         return try {
-            val result = acDevice!!.setAcWindMode(AC_CTRL_SOURCE_UI_KEY, mode)
+            val result = acDevice!!.setAcWindMode(BYDAutoAcDevice.AC_CTRL_SOURCE_UI_KEY, mode)
             log("▶ 空调风向=$mode，返回码=$result")
             result
         } catch (e: Throwable) {
@@ -246,7 +334,7 @@ class CarControl(private val logger: KnobHost) {
         if (acDevice == null && !initAcDevice(context)) return null
         return try {
             val mode = if (inner) 1 else 0
-            val result = acDevice!!.setAcCycleMode(AC_CTRL_SOURCE_UI_KEY, mode)
+            val result = acDevice!!.setAcCycleMode(BYDAutoAcDevice.AC_CTRL_SOURCE_UI_KEY, mode)
             log("▶ 空调循环=${if (inner) "内循环" else "外循环"}，返回码=$result")
             result
         } catch (e: Throwable) {
@@ -259,8 +347,9 @@ class CarControl(private val logger: KnobHost) {
         if (acDevice == null && !initAcDevice(context)) return null
         return try {
             val method = findMethod(acDevice!!, "getTemprature", Int::class.java)
+            log("◀ 读取空调(${areaLabel(area)})温度 getTemprature(area=$area)")
             val result = method.invoke(acDevice, area) as? Int
-            log("◀ 读取空调(${areaLabel(area)})温度 = $result")
+            logIntValue("result", result)
             result
         } catch (e: Throwable) {
             log("⚠️ 读取空调温度失败: ${e.message}")
@@ -269,11 +358,58 @@ class CarControl(private val logger: KnobHost) {
     }
 
     private fun areaLabel(area: Int): String = when (area) {
-        AC_TEMPERATURE_MAIN_DEPUTY -> "主副联动"
-        AC_TEMPERATURE_MAIN -> "主驾"
-        AC_TEMPERATURE_DEPUTY -> "副驾"
-        AC_TEMPERATURE_REAR -> "后排"
+        BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY -> "主副联动"
+        BYDAutoAcDevice.AC_TEMPERATURE_MAIN -> "主驾"
+        BYDAutoAcDevice.AC_TEMPERATURE_DEPUTY -> "副驾"
+        BYDAutoAcDevice.AC_TEMPERATURE_REAR -> "后排"
         else -> "区域$area"
+    }
+
+    // ==================== 环境光传感器 ====================
+
+    private val sensorListener = object : AbsBYDAutoSensorListener() {
+        override fun onLightIntensityChanged(value: Int) {
+            log("🔔 [Sensor监听] 光照等级变化 level=$value")
+            onLightIntensityChangedExternal?.invoke(value)
+        }
+    }
+
+    fun initSensorDevice(context: Context): Boolean {
+        return try {
+            sensorDevice = BYDAutoSensorDevice.getInstance(context)
+            if (sensorDevice == null) {
+                log("❌ BYDAutoSensorDevice.getInstance 返回 null")
+                return false
+            }
+            log("✅ 获取 BYDAutoSensorDevice 实例成功")
+            enableDevice(context, sensorDevice!!, "Sensor 设备")
+            sensorDevice!!.registerListener(sensorListener)
+            log("✅ 已注册 Sensor 监听器")
+            true
+        } catch (e: Throwable) {
+            log("❌ 初始化 Sensor 设备失败: ${e.javaClass.simpleName} - ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 光照（环境光）强度等级，1~5：1 最亮(>230Lux)，5 最暗(<80Lux)。
+     * 注意常量名——bydauto-sensor.md 文档里写的是 LIGHT_ILLUM_LEVELx，
+     * 反编译实际的 SDK 桩之后确认编译期常量其实叫
+     * BYDAutoSensorDevice.LIGHT_INTENSITY_LEVELx，文档和真实 SDK 对不上，
+     * 这里以反编译结果为准。
+     */
+    fun getLightIntensity(context: Context): Int? {
+        if (sensorDevice == null && !initSensorDevice(context)) return null
+        return try {
+            log("◀ 光照等级 getLightIntensity()")
+            val result = sensorDevice!!.getLightIntensity()
+            logIntValue("result", result)
+            result
+        } catch (e: Throwable) {
+            log("⚠️ 读取光照等级失败: ${e.message}")
+            null
+        }
     }
 
     fun checkBydPermissions(context: Context) {
@@ -284,6 +420,7 @@ class CarControl(private val logger: KnobHost) {
             "android.permission.BYDAUTO_AC_GET",
             "android.permission.BYDAUTO_AC_SET",
             "android.permission.BYDAUTO_AC_COMMON"
+            // Sensor 不需要单独申请权限，开发文档里写明了，不在这里列。
         )
         val pm = context.packageManager
         perms.forEach { perm ->

@@ -2,6 +2,9 @@ package cn.icarus.knob.plugin
 
 import android.content.Context
 import android.graphics.Color
+import android.hardware.bydauto.ac.BYDAutoAcDevice
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Gravity
 import android.view.KeyEvent
@@ -79,15 +82,64 @@ class MainPlugin : KnobPlugin {
     private var currentPageId: String = "car"
     private val knobCyclePages = listOf("car", "seat")
 
+    // AC/Sensor 监听器的回调不在主线程上（AIDL 回调线程），这两个处理
+    // 函数里要碰 View（refreshCurrentPage）和触发 knob 同步，必须先切回
+    // 主线程，不然直接崩 CalledFromWrongThreadException。
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     override fun init(context: Context, host: KnobHost) {
         Log.i(tag, "MainPlugin.init 调用")
         appContext = context
         this.host = host
-        carControl = CarControl(host)
+        carControl = CarControl(host).also {
+            it.onTemperatureChangedExternal = ::handleExternalTemperatureChange
+            it.onLightIntensityChangedExternal = ::handleExternalLightIntensityChange
+        }
         selfTest = PluginSelfTest(carControl!!, host)
         host.log("✅ 插件初始化完成（车控引擎已就绪）")
         restoreState()
         syncToKnob()
+    }
+
+    /**
+     * 语音/按键等车机自身渠道改了温度——AC 监听器（onTemperatureChanged）
+     * 触发的实时同步，跟触屏 ±/OK 走的是同一份 vehicleState、同一条
+     * refreshCurrentPage() 路径，只是触发源不同。后排/车外温度不跟踪
+     * （UI 上没有对应的地方显示），忽略。
+     */
+    private fun handleExternalTemperatureChange(area: Int, value: Int) {
+        mainHandler.post {
+            val changed = when (area) {
+                BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY -> { vehicleState.acMainDeputyTemp = value; true }
+                BYDAutoAcDevice.AC_TEMPERATURE_MAIN -> { vehicleState.acMainTemp = value; true }
+                BYDAutoAcDevice.AC_TEMPERATURE_DEPUTY -> { vehicleState.acDeputyTemp = value; true }
+                else -> false
+            }
+            if (!changed) return@post
+            persistState()
+            refreshCurrentPage()
+        }
+    }
+
+    /**
+     * 光照传感器等级变化（1 最亮~5 最暗）→ 换算成 knob 背光亮度百分比推
+     * 过去。这个映射是拍的，没有实车调过具体数值，先能用，觉得不合适
+     * 随时改这几个数字。
+     */
+    private fun brightnessForLightLevel(level: Int): Int = when (level) {
+        1 -> 100 // >230 Lux，环境最亮
+        2 -> 80
+        3 -> 60
+        4 -> 40
+        5 -> 20  // <80 Lux，环境最暗，留一点亮度，不完全黑
+        else -> 70
+    }
+
+    private fun handleExternalLightIntensityChange(level: Int) {
+        val percent = brightnessForLightLevel(level)
+        mainHandler.post {
+            host?.pushToKnob(mapOf("brightness" to percent))
+        }
     }
 
     /** 统一结果 Map：success 是否成功 / code 返回码 / value 结果 / message 说明。null 的 code/value 不放入。 */
@@ -106,7 +158,7 @@ class MainPlugin : KnobPlugin {
     /**
      * 控制域：所有写操作/命令。
      * 命令约定：
-     *   "init.all"          初始化 Setting + AC 设备
+     *   "init.all"          初始化 Setting + AC + Sensor 设备
      *   "seat.ventilating"  params: {state: Int(1=关,2=低,3=高)}
      *   "ac.temperature"    params: {area: Int(0-3), value: Int(17-33)}
      *   "ac.power"          params: {on: Boolean}
@@ -121,10 +173,17 @@ class MainPlugin : KnobPlugin {
         return try {
             when (command) {
                 "init.all" -> {
-                    ctrl.log("📦 初始化设备（Setting + AC）")
+                    ctrl.log("📦 初始化设备（Setting + AC + Sensor）")
                     val s = ctrl.initSettingDevice(context)
                     val a = ctrl.initAcDevice(context)
-                    if (s && a) resultMap(true, 0, message = "初始化成功")
+                    val se = ctrl.initSensorDevice(context)
+                    // Sensor 的监听器只在光照等级变化时才会触发回调，初始化
+                    // 完主动读一次当前等级、立刻推一次背光，不然要等第一次
+                    // 光照变化才会有初始亮度，之前一直是固件默认的最大亮度。
+                    if (se) {
+                        ctrl.getLightIntensity(context)?.let { handleExternalLightIntensityChange(it) }
+                    }
+                    if (s && a && se) resultMap(true, 0, message = "初始化成功")
                     else resultMap(false, null, message = "初始化失败")
                 }
                 "seat.ventilating" -> {
@@ -133,7 +192,7 @@ class MainPlugin : KnobPlugin {
                     codeResult(ctrl.setDriverSeatVentilating(context, state), "座椅通风执行完成", "座椅通风执行失败")
                 }
                 "ac.temperature" -> {
-                    val area = (params["area"] as? Number)?.toInt() ?: CarControl.AC_TEMPERATURE_MAIN
+                    val area = (params["area"] as? Number)?.toInt() ?: BYDAutoAcDevice.AC_TEMPERATURE_MAIN
                     val value = (params["value"] as? Number)?.toInt()
                         ?: return resultMap(false, null, message = "缺少 value")
                     codeResult(ctrl.setAcTemperature(context, area, value), "设置温度执行完成", "设置温度失败")
@@ -172,6 +231,8 @@ class MainPlugin : KnobPlugin {
      *   "selfTest"          一键全量自检（value=结果文本）
      *   "seat.ventilating"  读取主驾座椅通风状态（value=Int）
      *   "ac.temperature"    params: {area: Int} → 读取空调温度（value=Int）
+     *   "seat.probeMethods" 反射列举 Setting 设备上的全部方法，只打日志不调用
+     *   "seat.checkFeatures" 查座椅加热/通风 4 个 feature 是否配置为支持
      */
     override fun onQuery(query: String, params: Map<String, Any>): Map<String, Any>? {
         val ctrl = carControl ?: return null
@@ -183,6 +244,14 @@ class MainPlugin : KnobPlugin {
                     ctrl.checkBydPermissions(context)
                     resultMap(true, 0, message = "权限检查完成，详见日志")
                 }
+                "seat.probeMethods" -> {
+                    ctrl.probeSeatFeatureMethods(context)
+                    resultMap(true, 0, message = "扫描完成，详见日志")
+                }
+                "seat.checkFeatures" -> {
+                    ctrl.checkSeatFeatures(context)
+                    resultMap(true, 0, message = "检查完成，详见日志")
+                }
                 "selfTest" -> {
                     selfTest?.runAll(context)
                     resultMap(true, 0, value = selfTest?.lastResult() ?: "自检未初始化", message = "自检完成")
@@ -193,7 +262,7 @@ class MainPlugin : KnobPlugin {
                     else resultMap(false, null, message = "读取失败")
                 }
                 "ac.temperature" -> {
-                    val area = (params["area"] as? Number)?.toInt() ?: CarControl.AC_TEMPERATURE_MAIN
+                    val area = (params["area"] as? Number)?.toInt() ?: BYDAutoAcDevice.AC_TEMPERATURE_MAIN
                     val v = ctrl.getAcTemperature(context, area)
                     if (v != null) resultMap(true, 0, value = v, message = "读取成功")
                     else resultMap(false, null, message = "读取失败")
@@ -331,16 +400,16 @@ class MainPlugin : KnobPlugin {
             "car" -> {
                 if (vehicleState.acSeparate) {
                     if (knobValue != null) {
-                        vehicleState.acMainTemp = knobValue.coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+                        vehicleState.acMainTemp = knobValue.coerceIn(BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
                     }
                     persistState()
-                    commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN, vehicleState.acMainTemp)
+                    commitAcTemperature(BYDAutoAcDevice.AC_TEMPERATURE_MAIN, vehicleState.acMainTemp)
                 } else {
                     if (knobValue != null) {
-                        vehicleState.acMainDeputyTemp = knobValue.coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+                        vehicleState.acMainDeputyTemp = knobValue.coerceIn(BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
                     }
                     persistState()
-                    commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN_DEPUTY, vehicleState.acMainDeputyTemp)
+                    commitAcTemperature(BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY, vehicleState.acMainDeputyTemp)
                 }
                 refreshCurrentPage()
             }
@@ -386,9 +455,9 @@ class MainPlugin : KnobPlugin {
     private fun syncToKnob() {
         val (title, value, min, max) = when (currentPageId) {
             "car" -> if (vehicleState.acSeparate) {
-                DisplayInfo("空调温度(主驾)", vehicleState.acMainTemp, CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+                DisplayInfo("空调温度(主驾)", vehicleState.acMainTemp, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
             } else {
-                DisplayInfo("空调温度", vehicleState.acMainDeputyTemp, CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX)
+                DisplayInfo("空调温度", vehicleState.acMainDeputyTemp, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
             }
             "seat" -> DisplayInfo(seatLevelLabel(vehicleState.seatLevel), vehicleState.seatLevel, SEAT_LEVEL_MIN, SEAT_LEVEL_MAX)
             else -> DisplayInfo("首页", 0, 0, 0)
@@ -499,10 +568,10 @@ class MainPlugin : KnobPlugin {
         }
         val ctrl = carControl ?: return
         val context = appContext ?: return
-        vehicleState.acSeparate = ctrl.getAcTemperatureControlMode(context) == CarControl.AC_TEMPCTRL_SEPARATE_ON
-        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN_DEPUTY)?.let { vehicleState.acMainDeputyTemp = it }
-        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_MAIN)?.let { vehicleState.acMainTemp = it }
-        ctrl.getAcTemperature(context, CarControl.AC_TEMPERATURE_DEPUTY)?.let { vehicleState.acDeputyTemp = it }
+        vehicleState.acSeparate = ctrl.getAcTemperatureControlMode(context) == BYDAutoAcDevice.AC_TEMPCTRL_SEPARATE_ON
+        ctrl.getAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY)?.let { vehicleState.acMainDeputyTemp = it }
+        ctrl.getAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_MAIN)?.let { vehicleState.acMainTemp = it }
+        ctrl.getAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_DEPUTY)?.let { vehicleState.acDeputyTemp = it }
         persistState()
     }
 
@@ -523,21 +592,21 @@ class MainPlugin : KnobPlugin {
                     label = "联动温度",
                     value = vehicleState.acMainDeputyTemp,
                     onChange = { vehicleState.acMainDeputyTemp = it; persistState(); refreshCurrentPage() },
-                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN_DEPUTY, vehicleState.acMainDeputyTemp) }
+                    onOk = { commitAcTemperature(BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY, vehicleState.acMainDeputyTemp) }
                 ))
             } else {
                 addView(buildTempRow(
                     label = "主驾温度",
                     value = vehicleState.acMainTemp,
                     onChange = { vehicleState.acMainTemp = it; persistState(); refreshCurrentPage() },
-                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_MAIN, vehicleState.acMainTemp) }
+                    onOk = { commitAcTemperature(BYDAutoAcDevice.AC_TEMPERATURE_MAIN, vehicleState.acMainTemp) }
                 ))
                 addView(Ui.space(ctx, 0, 8))
                 addView(buildTempRow(
                     label = "副驾温度",
                     value = vehicleState.acDeputyTemp,
                     onChange = { vehicleState.acDeputyTemp = it; persistState(); refreshCurrentPage() },
-                    onOk = { commitAcTemperature(CarControl.AC_TEMPERATURE_DEPUTY, vehicleState.acDeputyTemp) }
+                    onOk = { commitAcTemperature(BYDAutoAcDevice.AC_TEMPERATURE_DEPUTY, vehicleState.acDeputyTemp) }
                 ))
             }
             addView(Ui.space(ctx, 0, 12))
@@ -553,11 +622,11 @@ class MainPlugin : KnobPlugin {
             addView(Ui.label(ctx, label))
             addView(Ui.hStack(ctx).apply {
                 addView(Ui.btn(ctx, "－") {
-                    onChange((value - 1).coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX))
+                    onChange((value - 1).coerceIn(BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX))
                 })
                 addView(Ui.text(ctx, "${value}°C", size = 18f, bold = true))
                 addView(Ui.btn(ctx, "＋") {
-                    onChange((value + 1).coerceIn(CarControl.AC_TEMP_CELSIUS_MIN, CarControl.AC_TEMP_CELSIUS_MAX))
+                    onChange((value + 1).coerceIn(BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX))
                 })
                 addView(Ui.btn(ctx, "OK") { onOk() })
             })
@@ -604,6 +673,15 @@ class MainPlugin : KnobPlugin {
             addView(Ui.space(ctx, 0, 12))
             addView(buildSeatRow())
             addView(Ui.space(ctx, 0, 12))
+            // 临时调试按钮：座椅加热/通风隐藏接口探测，结果只打日志，不调用
+            // 任何真实车控方法——排查完可以删掉。
+            addView(Ui.btn(ctx, "🔍 扫描 Setting 设备方法") {
+                carControl?.probeSeatFeatureMethods(appContext!!)
+            })
+            addView(Ui.btn(ctx, "🔍 查座椅加热/通风 Feature") {
+                carControl?.checkSeatFeatures(appContext!!)
+            })
+            addView(Ui.space(ctx, 0, 12))
             addView(Ui.btn(ctx, "❄️ 去空调页") { switchToPage("car") })
             addView(Ui.btn(ctx, "← 返回首页") { switchToPage("home") })
         }
@@ -638,5 +716,6 @@ class MainPlugin : KnobPlugin {
 
     override fun onDestroy() {
         Log.i(tag, "MainPlugin.onDestroy")
+        carControl?.unregisterListeners()
     }
 }
