@@ -3,6 +3,7 @@ package cn.icarus.knob.plugin
 import android.content.Context
 import android.graphics.Color
 import android.hardware.bydauto.ac.BYDAutoAcDevice
+import android.hardware.bydauto.setting.BYDAutoSettingDevice
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -36,8 +37,6 @@ class MainPlugin : KnobPlugin {
 
         private const val PREFS_NAME = "knob_plugin_state"
         private const val KEY_PAGE = "page"
-        private const val KEY_AC_SEPARATE = "ac_separate"
-        private const val KEY_AC_MAIN_DEPUTY = "ac_main_deputy"
         private const val KEY_AC_MAIN = "ac_main"
         private const val KEY_AC_DEPUTY = "ac_deputy"
         private const val KEY_SEAT_LEVEL = "seat_level"
@@ -55,12 +54,17 @@ class MainPlugin : KnobPlugin {
     /**
      * 车辆状态：插件内唯一数据源，触屏页面和旋钮同步都读写这一份，不再有
      * 各自独立的状态。SIMULATE_CAR_CONTROL=true 时纯本地值；=false 时
-     * 由 loadAcState() 从 CarControl 真实读取覆盖（座椅暂时没有对应的真实
-     * 读取接口，始终是本地值）。
+     * 由 refreshAcTemperatures() 从 CarControl 真实读取覆盖（座椅暂时没有
+     * 对应的真实读取接口，始终是本地值）。
+     *
+     * 分控开关不再单独缓存——它不是一个可以随便读/信的状态（没有监听
+     * 接口，getAcTemperatureControlMode 也可能因为语音/按键早就跟这里
+     * 缓存的不一样），改成完全由"当前停靠在哪个停靠点"决定：停靠在
+     * ac_link 就代表要联动、ac_main/ac_deputy 就代表要分控，提交时无条件
+     * 断言一次，见 commitAc()。acMainTemp 兼作联动模式下显示/编辑的温度
+     * （分控关闭时主驾副驾理论上是同一个值）。
      */
     private data class VehicleState(
-        var acSeparate: Boolean = false,
-        var acMainDeputyTemp: Int = 22,
         var acMainTemp: Int = 22,
         var acDeputyTemp: Int = 22,
         var seatLevel: Int = 0,
@@ -76,11 +80,16 @@ class MainPlugin : KnobPlugin {
     private var pageContainer: ViewGroup? = null
     private val vehicleState = VehicleState()
 
-    // 当前显示的页面 id，持久化 + 同步给 knob 屏幕。knobCyclePages 是旋钮
-    // 单击（Tab）能循环切到的页面，首页不算在内——旋钮场景下没有"回菜单"
-    // 的需求，首页只是触屏进入时的一个入口，靠页面里的按钮跳转。
-    private var currentPageId: String = "car"
-    private val knobCyclePages = listOf("car", "seat")
+    // 当前停靠点 id，持久化 + 同步给 knob 屏幕。这一份状态是旋钮和触屏
+    // 共用的同一套状态机——物理旋钮的转/单击/长按和触屏的按钮只是同一套
+    // 状态机的两种输入方式，不是各自独立的两份逻辑。knobCyclePages 是
+    // 单击（物理 Tab / 触屏"下一个"按钮）能循环到的停靠点，首页不算在
+    // 内——旋钮场景下没有"回菜单"的需求，首页只是触屏进入时的一个入口，
+    // 靠页面里的按钮跳转，旋钮单击不会经过它。
+    private var currentPageId: String = "ac_link"
+    private val knobCyclePages = listOf("ac_link", "ac_main", "ac_deputy", "seat")
+
+    private fun isAcStop(pageId: String) = pageId == "ac_link" || pageId == "ac_main" || pageId == "ac_deputy"
 
     // AC/Sensor 监听器的回调不在主线程上（AIDL 回调线程），这两个处理
     // 函数里要碰 View（refreshCurrentPage）和触发 knob 同步，必须先切回
@@ -104,14 +113,15 @@ class MainPlugin : KnobPlugin {
     /**
      * 语音/按键等车机自身渠道改了温度——AC 监听器（onTemperatureChanged）
      * 触发的实时同步，跟触屏 ±/OK 走的是同一份 vehicleState、同一条
-     * refreshCurrentPage() 路径，只是触发源不同。后排/车外温度不跟踪
-     * （UI 上没有对应的地方显示），忽略。
+     * refreshCurrentPage() 路径，只是触发源不同。MAIN_DEPUTY 和 MAIN 都
+     * 归到 acMainTemp（联动模式下这俩理论上是同一个值，ac_link 停靠点
+     * 显示/编辑的就是 acMainTemp）。后排/车外温度不跟踪（UI 上没有对应
+     * 的地方显示），忽略。
      */
     private fun handleExternalTemperatureChange(area: Int, value: Int) {
         mainHandler.post {
             val changed = when (area) {
-                BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY -> { vehicleState.acMainDeputyTemp = value; true }
-                BYDAutoAcDevice.AC_TEMPERATURE_MAIN -> { vehicleState.acMainTemp = value; true }
+                BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY, BYDAutoAcDevice.AC_TEMPERATURE_MAIN -> { vehicleState.acMainTemp = value; true }
                 BYDAutoAcDevice.AC_TEMPERATURE_DEPUTY -> { vehicleState.acDeputyTemp = value; true }
                 else -> false
             }
@@ -360,23 +370,18 @@ class MainPlugin : KnobPlugin {
     /**
      * 按键处理，返回是否消费。
      *
-     * 旋钮映射：Tab=切换页面（车控页/座椅页循环），Enter=确认（对应触屏
-     * 页面上的 OK）。旋钮转动本身完全在固件本地处理、不再上报给手机——
-     * 长按 Enter 时才把旋钮本地编辑到的最终值（value）一起带过来，直接
-     * 拿去应用，不需要手机在转动过程中跟着增量调整。系统返回键不再有
-     * 特殊处理——页面之间是平级切换，没有"返回上一页"这个概念了，交给
-     * 壳/系统默认处理。按下和抬起都要消费，只吃一半会让系统按键状态
-     * 错乱。
+     * 旋钮映射：Tab=切下一个停靠点（ac_link/ac_main/ac_deputy/seat 循环），
+     * Enter=确认（对应触屏页面上的 OK）。旋钮转动本身完全在固件本地处理、
+     * 不再上报给手机——长按 Enter 时才把旋钮本地编辑到的最终值（value）
+     * 一起带过来，直接拿去应用，不需要手机在转动过程中跟着增量调整。
+     * 系统返回键不再有特殊处理——停靠点之间是平级切换，没有"返回上一个"
+     * 这个概念，交给壳/系统默认处理。按下和抬起都要消费，只吃一半会让
+     * 系统按键状态错乱。
      */
     private fun handleKey(code: Int, action: Int, value: Int?): Boolean {
         when (code) {
             KeyEvent.KEYCODE_TAB -> {
-                if (action == KeyEvent.ACTION_UP) {
-                    val idx = knobCyclePages.indexOf(currentPageId)
-                    val next = knobCyclePages[if (idx == -1) 0 else (idx + 1) % knobCyclePages.size]
-                    host?.log("🔀 Tab -> $next")
-                    switchToPage(next)
-                }
+                if (action == KeyEvent.ACTION_UP) advanceStop()
                 return true
             }
             KeyEvent.KEYCODE_ENTER -> {
@@ -389,28 +394,48 @@ class MainPlugin : KnobPlugin {
     }
 
     /**
-     * Enter：应用当前页面的主要数值，等价于触屏上点那一行的 OK。
+     * 切到循环列表里的下一个停靠点——物理旋钮单击和触屏"下一个"按钮
+     * 都调这一个函数，保证两条输入路径走的是同一套状态机。
+     */
+    private fun advanceStop() {
+        val idx = knobCyclePages.indexOf(currentPageId)
+        val next = knobCyclePages[if (idx == -1) 0 else (idx + 1) % knobCyclePages.size]
+        host?.log("🔀 下一个停靠点 -> $next")
+        switchToPage(next)
+    }
+
+    /**
+     * Enter/OK：应用当前停靠点的主要数值。
      * @param knobValue 旋钮本地编辑到的最终值（长按时固件带过来的），
      *   写入 vehicleState 后再提交——旋钮转动期间手机完全不知道中间值，
-     *   只在这一下才知道最终结果。knobValue 为 null（比如系统按键触发
-     *   的 Enter，没有旋钮本地状态）时直接沿用 vehicleState 里已有的值。
+     *   只在这一下才知道最终结果。knobValue 为 null（比如触屏 OK 按钮
+     *   触发，本地值早就在 onChange 里改好了）时直接沿用 vehicleState
+     *   里已有的值。
      */
     private fun applyPrimaryValue(knobValue: Int?) {
         when (currentPageId) {
-            "car" -> {
-                if (vehicleState.acSeparate) {
-                    if (knobValue != null) {
-                        vehicleState.acMainTemp = knobValue.coerceIn(BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
-                    }
-                    persistState()
-                    commitAcTemperature(BYDAutoAcDevice.AC_TEMPERATURE_MAIN, vehicleState.acMainTemp)
-                } else {
-                    if (knobValue != null) {
-                        vehicleState.acMainDeputyTemp = knobValue.coerceIn(BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
-                    }
-                    persistState()
-                    commitAcTemperature(BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY, vehicleState.acMainDeputyTemp)
+            "ac_link" -> {
+                if (knobValue != null) {
+                    vehicleState.acMainTemp = knobValue.coerceIn(BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
                 }
+                persistState()
+                commitAc(separate = false, area = BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY, value = vehicleState.acMainTemp)
+                refreshCurrentPage()
+            }
+            "ac_main" -> {
+                if (knobValue != null) {
+                    vehicleState.acMainTemp = knobValue.coerceIn(BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
+                }
+                persistState()
+                commitAc(separate = true, area = BYDAutoAcDevice.AC_TEMPERATURE_MAIN, value = vehicleState.acMainTemp)
+                refreshCurrentPage()
+            }
+            "ac_deputy" -> {
+                if (knobValue != null) {
+                    vehicleState.acDeputyTemp = knobValue.coerceIn(BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
+                }
+                persistState()
+                commitAc(separate = true, area = BYDAutoAcDevice.AC_TEMPERATURE_DEPUTY, value = vehicleState.acDeputyTemp)
                 refreshCurrentPage()
             }
             "seat" -> {
@@ -444,28 +469,53 @@ class MainPlugin : KnobPlugin {
     }
 
     /**
-     * 把当前页面的"主要数值"同步给旋钮屏幕（走 host.pushToKnob -> BLE -> ESP32），
-     * 作为固件本地编辑的起点。knob 自己不知道页面/模块的概念，只管按
-     * 拿到的 title/value/min/max 原样显示；此后转动旋钮只改固件本地的
-     * 副本，不会再触发这个同步，直到长按确认把最终值带回来、或者切页面/
-     * 重新进页面时再推一次新的起点（空调页分控开时是主驾温度，关时是
-     * 联动温度；座椅页是 seatLevel）。min<0（座椅）时固件会画成从中间
-     * 向两侧扩展的圆弧，见 firmware/src/main.cpp。
+     * 把当前停靠点同步给旋钮屏幕（走 host.pushToKnob -> BLE -> ESP32），
+     * 作为固件本地编辑的起点。这里直接按当前停靠点拼一个 Map，不同停靠点
+     * 带的字段不完全一样——不再用一个固定形状的结构体强行统一，以后加/
+     * 改某个停靠点的字段只影响它自己这一条分支。"layout" 字段告诉固件
+     * 该用哪种画法（不是靠"有没有某个字段"去反推），"value_main"/
+     * "value_deputy" 这两个字段名固定指代主驾/副驾，不用无指向的
+     * value/value2。此后转动旋钮只改固件本地的副本，不会再触发这个同步，
+     * 直到长按确认把最终值带回来、或者切停靠点/重新进页面时再推一次新的
+     * 起点。min<0（座椅）时固件会画成从中间向两侧扩展的圆弧，见
+     * firmware/src/main.cpp。
      */
     private fun syncToKnob() {
-        val (title, value, min, max) = when (currentPageId) {
-            "car" -> if (vehicleState.acSeparate) {
-                DisplayInfo("空调温度(主驾)", vehicleState.acMainTemp, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
-            } else {
-                DisplayInfo("空调温度", vehicleState.acMainDeputyTemp, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN, BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX)
-            }
-            "seat" -> DisplayInfo(seatLevelLabel(vehicleState.seatLevel), vehicleState.seatLevel, SEAT_LEVEL_MIN, SEAT_LEVEL_MAX)
-            else -> DisplayInfo("首页", 0, 0, 0)
+        val data: Map<String, Any> = when (currentPageId) {
+            "ac_link" -> mapOf(
+                "layout" to "ac_link",
+                "title" to "联动",
+                "value" to vehicleState.acMainTemp,
+                "min" to BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN,
+                "max" to BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX,
+            )
+            "ac_main" -> mapOf(
+                "layout" to "ac_split_main",
+                "title" to "主驾",
+                "value_main" to vehicleState.acMainTemp,
+                "value_deputy" to vehicleState.acDeputyTemp,
+                "min" to BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN,
+                "max" to BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX,
+            )
+            "ac_deputy" -> mapOf(
+                "layout" to "ac_split_deputy",
+                "title" to "副驾",
+                "value_main" to vehicleState.acMainTemp,
+                "value_deputy" to vehicleState.acDeputyTemp,
+                "min" to BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MIN,
+                "max" to BYDAutoAcDevice.AC_TEMP_IN_CELSIUS_MAX,
+            )
+            "seat" -> mapOf(
+                "layout" to "seat",
+                "title" to seatLevelLabel(vehicleState.seatLevel),
+                "value" to vehicleState.seatLevel,
+                "min" to SEAT_LEVEL_MIN,
+                "max" to SEAT_LEVEL_MAX,
+            )
+            else -> mapOf("layout" to "none", "title" to "首页", "value" to 0, "min" to 0, "max" to 0)
         }
-        host?.pushToKnob(mapOf("title" to title, "value" to value, "min" to min, "max" to max))
+        host?.pushToKnob(data)
     }
-
-    private data class DisplayInfo(val title: String, val value: Int, val min: Int, val max: Int)
 
     // ==================== 状态持久化（进程重启后恢复页面 + 车辆状态） ====================
 
@@ -473,8 +523,6 @@ class MainPlugin : KnobPlugin {
         val ctx = appContext ?: return
         ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
             .putString(KEY_PAGE, currentPageId)
-            .putBoolean(KEY_AC_SEPARATE, vehicleState.acSeparate)
-            .putInt(KEY_AC_MAIN_DEPUTY, vehicleState.acMainDeputyTemp)
             .putInt(KEY_AC_MAIN, vehicleState.acMainTemp)
             .putInt(KEY_AC_DEPUTY, vehicleState.acDeputyTemp)
             .putInt(KEY_SEAT_LEVEL, vehicleState.seatLevel)
@@ -484,9 +532,12 @@ class MainPlugin : KnobPlugin {
     private fun restoreState() {
         val ctx = appContext ?: return
         val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        currentPageId = prefs.getString(KEY_PAGE, "car") ?: "car"
-        vehicleState.acSeparate = prefs.getBoolean(KEY_AC_SEPARATE, false)
-        vehicleState.acMainDeputyTemp = prefs.getInt(KEY_AC_MAIN_DEPUTY, 22)
+        currentPageId = prefs.getString(KEY_PAGE, "ac_link") ?: "ac_link"
+        // 之前的版本用的是 "car"/"seat" 两个页面 id，这台测试机上很可能
+        // 还残留着旧值——不是这次改动要处理的"不可能场景"，是几乎必然
+        // 会在自己手上碰到的情况，兜底回默认停靠点，不然 pages[currentPageId]
+        // 会取不到构建函数，屏幕直接空白。
+        if (currentPageId !in pages) currentPageId = "ac_link"
         vehicleState.acMainTemp = prefs.getInt(KEY_AC_MAIN, 22)
         vehicleState.acDeputyTemp = prefs.getInt(KEY_AC_DEPUTY, 22)
         vehicleState.seatLevel = prefs.getInt(KEY_SEAT_LEVEL, 0)
@@ -497,7 +548,9 @@ class MainPlugin : KnobPlugin {
     /** 页面注册表：pageId → 构建函数。新增页面只需在此加一行，并写对应的构建函数。 */
     private val pages: Map<String, () -> View> = mapOf(
         "home" to { buildHomePage() },
-        "car" to { buildCarPage() },
+        "ac_link" to { buildAcPage() },
+        "ac_main" to { buildAcPage() },
+        "ac_deputy" to { buildAcPage() },
         "seat" to { buildSeatPage() },
     )
 
@@ -505,7 +558,7 @@ class MainPlugin : KnobPlugin {
     private fun bindUi(container: ViewGroup) {
         pageContainer = container
         Log.i(tag, "ui.bind: 页面容器已就绪，当前页面=$currentPageId")
-        if (currentPageId == "car") loadAcState()
+        if (isAcStop(currentPageId)) refreshAcTemperatures()
         refreshCurrentPage()
     }
 
@@ -517,11 +570,11 @@ class MainPlugin : KnobPlugin {
     }
 
     /**
-     * 真正切换到另一个页面（跟同页内数值调整的 refreshCurrentPage 区分开）：
-     * 更新 currentPageId、持久化、如果切到空调页顺带刷新一次真实车况，
-     * 最后交给 refreshCurrentPage() 重绘并同步给 knob。不管是旋钮 Tab
-     * 触发的还是页面内点按钮触发的，都走这一个函数，保证两条路径下
-     * knob 收到的通知是一致的。
+     * 真正切换到另一个停靠点（跟同停靠点内数值调整的 refreshCurrentPage
+     * 区分开）：更新 currentPageId、持久化、如果切到空调类停靠点顺带刷新
+     * 一次真实车况，最后交给 refreshCurrentPage() 重绘并同步给 knob。
+     * 不管是旋钮 Tab/触屏"下一个"按钮触发的，还是首页菜单直接跳转触发
+     * 的，都走这一个函数，保证所有输入路径下 knob 收到的通知是一致的。
      */
     private fun switchToPage(pageId: String) {
         if (!pages.containsKey(pageId)) {
@@ -529,7 +582,7 @@ class MainPlugin : KnobPlugin {
             return
         }
         currentPageId = pageId
-        if (pageId == "car") loadAcState()
+        if (isAcStop(pageId)) refreshAcTemperatures()
         persistState()
         refreshCurrentPage()
     }
@@ -546,71 +599,97 @@ class MainPlugin : KnobPlugin {
         syncToKnob()
     }
 
-    /** 首页：跳转到空调页 / 座椅页（纯菜单，不接旋钮 Tab 循环） */
+    /** 首页：跳转到空调（联动）页 / 座椅页（纯菜单，不接旋钮 Tab 循环） */
     private fun buildHomePage(): View {
         val ctx = appContext!!
         return Ui.vStack(ctx).apply {
             gravity = Gravity.CENTER
             setBackgroundColor(Color.parseColor("#FFFFFF"))
             addView(Ui.title(ctx, "🎛 插件首页"))
-            addView(Ui.hint(ctx, "旋钮单击在空调页/座椅页之间循环切换\n首页只能触屏进入"))
+            addView(Ui.hint(ctx, "旋钮单击在联动/主驾/副驾/座椅 4 个停靠点间循环切换\n首页只能触屏进入"))
             addView(Ui.space(ctx, 0, 12))
-            addView(Ui.btn(ctx, "❄️ 去空调页") { switchToPage("car") })
+            addView(Ui.btn(ctx, "❄️ 去空调页") { switchToPage("ac_link") })
             addView(Ui.btn(ctx, "🪑 去座椅页") { switchToPage("seat") })
         }
     }
 
-    /** 从车况刷新分控开关 + 两个区域的默认温度（进空调页时调，页内调整不调）。 */
-    private fun loadAcState() {
+    /**
+     * 从车况刷新主驾/副驾温度（进空调类停靠点时调，停靠点内部调整不调）。
+     * 只读 MAIN/DEPUTY 这两个 area——MAIN_DEPUTY 对 getTemprature 来说是
+     * 无效参数（只对 setAcTemperature 的 type 有效，官方文档写明了，这也
+     * 是之前那个"-21亿"读数的根因），不读它；联动停靠点显示/编辑的
+     * acMainTemp 已经靠这里刷新。分控开关不读也不缓存，见 VehicleState
+     * 的注释。
+     */
+    private fun refreshAcTemperatures() {
         if (SIMULATE_CAR_CONTROL) {
             host?.log("🧪（模拟）跳过读取车况，沿用当前本地值")
             return
         }
         val ctrl = carControl ?: return
         val context = appContext ?: return
-        vehicleState.acSeparate = ctrl.getAcTemperatureControlMode(context) == BYDAutoAcDevice.AC_TEMPCTRL_SEPARATE_ON
-        ctrl.getAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY)?.let { vehicleState.acMainDeputyTemp = it }
         ctrl.getAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_MAIN)?.let { vehicleState.acMainTemp = it }
         ctrl.getAcTemperature(context, BYDAutoAcDevice.AC_TEMPERATURE_DEPUTY)?.let { vehicleState.acDeputyTemp = it }
         persistState()
     }
 
-    /** 分控关：一组联动温度框；分控开：主驾/副驾各一组。 */
-    private fun buildCarPage(): View {
+    /**
+     * 空调三个停靠点共用一个构建函数，按 currentPageId 决定画法——跟旋钮
+     * 屏幕的 layout 分发是同一个思路：ac_link 只有联动一组温度框；
+     * ac_main/ac_deputy 各自的主要那组可编辑，另一侧只读展示做参考，
+     * 不提供 ± /OK。
+     */
+    private fun buildAcPage(): View {
         val ctx = appContext!!
+        val title = when (currentPageId) {
+            "ac_main" -> "❄️ 空调温度（分控·主驾）"
+            "ac_deputy" -> "❄️ 空调温度（分控·副驾）"
+            else -> "❄️ 空调温度（联动）"
+        }
         return Ui.vStack(ctx).apply {
             gravity = Gravity.CENTER
             setBackgroundColor(Color.parseColor("#E3F2FD"))
-            addView(Ui.title(ctx, "❄️ 空调温度"))
-            addView(Ui.space(ctx, 0, 8))
-            addView(Ui.btn(ctx, if (vehicleState.acSeparate) "分控：开（点击关闭）" else "分控：关（点击开启）") {
-                toggleAcSeparate()
-            })
+            addView(Ui.title(ctx, title))
             addView(Ui.space(ctx, 0, 12))
-            if (!vehicleState.acSeparate) {
-                addView(buildTempRow(
+            when (currentPageId) {
+                "ac_link" -> addView(buildTempRow(
                     label = "联动温度",
-                    value = vehicleState.acMainDeputyTemp,
-                    onChange = { vehicleState.acMainDeputyTemp = it; persistState(); refreshCurrentPage() },
-                    onOk = { commitAcTemperature(BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY, vehicleState.acMainDeputyTemp) }
-                ))
-            } else {
-                addView(buildTempRow(
-                    label = "主驾温度",
                     value = vehicleState.acMainTemp,
                     onChange = { vehicleState.acMainTemp = it; persistState(); refreshCurrentPage() },
-                    onOk = { commitAcTemperature(BYDAutoAcDevice.AC_TEMPERATURE_MAIN, vehicleState.acMainTemp) }
+                    onOk = {
+                        commitAc(separate = false, area = BYDAutoAcDevice.AC_TEMPERATURE_MAIN_DEPUTY, value = vehicleState.acMainTemp)
+                        refreshCurrentPage()
+                    }
                 ))
-                addView(Ui.space(ctx, 0, 8))
-                addView(buildTempRow(
-                    label = "副驾温度",
-                    value = vehicleState.acDeputyTemp,
-                    onChange = { vehicleState.acDeputyTemp = it; persistState(); refreshCurrentPage() },
-                    onOk = { commitAcTemperature(BYDAutoAcDevice.AC_TEMPERATURE_DEPUTY, vehicleState.acDeputyTemp) }
-                ))
+                "ac_main" -> {
+                    addView(buildTempRow(
+                        label = "主驾温度",
+                        value = vehicleState.acMainTemp,
+                        onChange = { vehicleState.acMainTemp = it; persistState(); refreshCurrentPage() },
+                        onOk = {
+                            commitAc(separate = true, area = BYDAutoAcDevice.AC_TEMPERATURE_MAIN, value = vehicleState.acMainTemp)
+                            refreshCurrentPage()
+                        }
+                    ))
+                    addView(Ui.space(ctx, 0, 8))
+                    addView(Ui.label(ctx, "副驾温度 ${vehicleState.acDeputyTemp}°C（参考，去副驾停靠点调整）"))
+                }
+                "ac_deputy" -> {
+                    addView(buildTempRow(
+                        label = "副驾温度",
+                        value = vehicleState.acDeputyTemp,
+                        onChange = { vehicleState.acDeputyTemp = it; persistState(); refreshCurrentPage() },
+                        onOk = {
+                            commitAc(separate = true, area = BYDAutoAcDevice.AC_TEMPERATURE_DEPUTY, value = vehicleState.acDeputyTemp)
+                            refreshCurrentPage()
+                        }
+                    ))
+                    addView(Ui.space(ctx, 0, 8))
+                    addView(Ui.label(ctx, "主驾温度 ${vehicleState.acMainTemp}°C（参考，去主驾停靠点调整）"))
+                }
             }
             addView(Ui.space(ctx, 0, 12))
-            addView(Ui.btn(ctx, "🪑 去座椅页") { switchToPage("seat") })
+            addView(Ui.btn(ctx, "🔀 下一个") { advanceStop() })
             addView(Ui.btn(ctx, "← 返回首页") { switchToPage("home") })
         }
     }
@@ -633,37 +712,25 @@ class MainPlugin : KnobPlugin {
         }
     }
 
-    /** 切分控：调用 setAcTemperatureControlMode，返回码非 null 就认为成功，直接翻本地状态。 */
-    private fun toggleAcSeparate() {
+    /**
+     * 空调停靠点的提交：先无条件断言这个停靠点要求的分控状态，再下发
+     * 温度——不比较本地缓存是不是已经是这个状态（分控没有监听接口，缓存
+     * 可能因为语音/按键早就跟车况不一致了），每次提交都强制断言一次最
+     * 安全。顺序不能反：分控没真正切过去之前先写 area=MAIN/DEPUTY 的
+     * 温度大概率会被联动模式吞掉或不生效。
+     */
+    private fun commitAc(separate: Boolean, area: Int, value: Int) {
         if (SIMULATE_CAR_CONTROL) {
-            vehicleState.acSeparate = !vehicleState.acSeparate
-            host?.log("🧪（模拟）setAcTemperatureControlMode separate=${vehicleState.acSeparate}")
-            persistState()
-            refreshCurrentPage()
+            host?.log("🧪（模拟）setAcTemperatureControlMode separate=$separate; setAcTemperature area=$area value=$value")
             return
         }
         val ctrl = carControl ?: return
         val context = appContext ?: return
-        val result = ctrl.setAcTemperatureControlMode(context, !vehicleState.acSeparate)
-        if (result != null) {
-            vehicleState.acSeparate = !vehicleState.acSeparate
-            persistState()
-            refreshCurrentPage()
-        }
+        ctrl.setAcTemperatureControlMode(context, separate)
+        ctrl.setAcTemperature(context, area, value)
     }
 
-    /** OK 键：真正下发 setAcTemperature，source 固定 UI_KEY（CarControl 内部已带）。 */
-    private fun commitAcTemperature(type: Int, value: Int) {
-        if (SIMULATE_CAR_CONTROL) {
-            host?.log("🧪（模拟）setAcTemperature type=$type value=$value")
-            return
-        }
-        val ctrl = carControl ?: return
-        val context = appContext ?: return
-        ctrl.setAcTemperature(context, type, value)
-    }
-
-    /** 座椅页：跳转到首页 / 空调页（占位页面，还没接真实座椅通风状态）。 */
+    /** 座椅页：下一个停靠点循环回联动页 / 首页菜单（占位页面，还没接真实座椅加热状态）。 */
     private fun buildSeatPage(): View {
         val ctx = appContext!!
         return Ui.vStack(ctx).apply {
@@ -681,8 +748,26 @@ class MainPlugin : KnobPlugin {
             addView(Ui.btn(ctx, "🔍 查座椅加热/通风 Feature") {
                 carControl?.checkSeatFeatures(appContext!!)
             })
+            addView(Ui.space(ctx, 0, 8))
+            // 反射扫描 + 反编译 dotix 都确认了 setSeatHeatingState(seat, state)/
+            // getSeatHeatingState(seat) 这套接口真实存在，state 官方常量是
+            // SEAT_HEATING_OFF/LOW/HIGH=1/2/3——这几个按钮就是拿这三个值
+            // 实际调一下，看物理座椅有没有反应，确认参数含义对不对。
+            // 排查完可以删掉。
+            addView(Ui.btn(ctx, "🔥 主驾加热-关(1)") {
+                carControl?.setSeatHeating(appContext!!, BYDAutoSettingDevice.DRIVER_SEAT, 1)
+            })
+            addView(Ui.btn(ctx, "🔥 主驾加热-低(2)") {
+                carControl?.setSeatHeating(appContext!!, BYDAutoSettingDevice.DRIVER_SEAT, 2)
+            })
+            addView(Ui.btn(ctx, "🔥 主驾加热-高(3)") {
+                carControl?.setSeatHeating(appContext!!, BYDAutoSettingDevice.DRIVER_SEAT, 3)
+            })
+            addView(Ui.btn(ctx, "🔍 读主驾加热状态") {
+                carControl?.getSeatHeating(appContext!!, BYDAutoSettingDevice.DRIVER_SEAT)
+            })
             addView(Ui.space(ctx, 0, 12))
-            addView(Ui.btn(ctx, "❄️ 去空调页") { switchToPage("car") })
+            addView(Ui.btn(ctx, "🔀 下一个") { advanceStop() })
             addView(Ui.btn(ctx, "← 返回首页") { switchToPage("home") })
         }
     }

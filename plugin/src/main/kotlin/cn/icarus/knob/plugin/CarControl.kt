@@ -149,6 +149,46 @@ class CarControl(private val logger: KnobHost) {
     }
 
     /**
+     * 座椅加热——跟座椅通风一样是隐藏方法（反射列举确认过真机上
+     * getSeatHeatingState(int)/setSeatHeatingState(int,int) 确实存在，
+     * 但编译期的 bydauto-openapi.jar 桩包没声明它们，直接 import 编不过），
+     * 得用反射调。seat 参数不写死主驾，直接传 BYDAutoSettingDevice.
+     * DRIVER_SEAT/PASSENGER_SEAT——反编译 dotix 的座椅加热实现
+     * （BYDAutoSettingDeviceLoad.java/BydSDKGlobal.java）确认了同一套接口
+     * 支持 4 个座位（1=主驾,2=副驾,3=后左,4=后右），state 用官方常量
+     * BYDAutoSettingDevice.SEAT_HEATING_OFF/LOW/HIGH（1/2/3，跟座椅通风
+     * 是同一套取值）。另外还反射到一个 setSeatHeatingState1/
+     * getSeatHeatingState1 的"1"后缀重载，dotix 自己声明了但业务代码里
+     * 从来没调用过，用途不明，这里先不接。
+     */
+    fun setSeatHeating(context: Context, seat: Int, state: Int): Int? {
+        if (settingDevice == null && !initSettingDevice(context)) return null
+        return try {
+            val method = findMethod(settingDevice!!, "setSeatHeatingState", Int::class.java, Int::class.java)
+            val result = method.invoke(settingDevice, seat, state) as? Int
+            log("▶ 座椅(seat=$seat)加热 → 档位=$state，返回码=$result (0=成功)")
+            result
+        } catch (e: Throwable) {
+            log("❌ setSeatHeatingState 调用失败:\n${exceptionDetail(e)}")
+            null
+        }
+    }
+
+    fun getSeatHeating(context: Context, seat: Int): Int? {
+        if (settingDevice == null && !initSettingDevice(context)) return null
+        return try {
+            val method = findMethod(settingDevice!!, "getSeatHeatingState", Int::class.java)
+            val result = method.invoke(settingDevice, seat) as? Int
+            log("◀ 座椅(seat=$seat)加热状态 (1=关,2=低,3=高)")
+            logIntValue("result", result)
+            result
+        } catch (e: Throwable) {
+            log("⚠️ 读取座椅加热状态失败: ${e.message}")
+            null
+        }
+    }
+
+    /**
      * 反射列举 BYDAutoSettingDevice 上的全部方法（含未公开的），不按名字筛选——
      * 官方常量里已经有 FEATURE_DRIVER_SEAT_HEATING 等 4 个座椅加热/通风的
      * feature 常量，猜测应该有配套的隐藏方法，但方法名不一定跟 Seat/Heat/Vent
@@ -206,28 +246,20 @@ class CarControl(private val logger: KnobHost) {
     // 这个方法实际是 final 的（编译期用的 bydauto-openapi.jar 桩包没标出
     // 这一点），框架就是故意锁死不让子类覆写，逼着用具名回调，这条路走
     // 不通，不要再加。
-    private val acListener = object : AbsBYDAutoAcListener() {
-        override fun onTemperatureChanged(area: Int, value: Int) {
-            log("🔔 [AC监听] 温度变化 area=${areaLabel(area)} value=$value")
-            onTemperatureChangedExternal?.invoke(area, value)
-        }
-        override fun onAcStarted() = log("🔔 [AC监听] 空调开启")
-        override fun onAcStoped() = log("🔔 [AC监听] 空调关闭")
-        override fun onAcRearStarted() = log("🔔 [AC监听] 后排空调开启")
-        override fun onAcRearStoped() = log("🔔 [AC监听] 后排空调关闭")
-        override fun onAcCtrlModeChanged(mode: Int) = log("🔔 [AC监听] 控制方式(手动/自动)变化 mode=$mode")
-        override fun onAcCycleModeChanged(mode: Int) = log("🔔 [AC监听] 循环方式变化 mode=$mode")
-        override fun onAcVentilationStateChanged(state: Int) = log("🔔 [AC监听] 驻车通风变化 state=$state")
-        override fun onAcDefrostStateChanged(area: Int, state: Int) = log("🔔 [AC监听] 除霜变化 area=$area state=$state")
-        override fun onAcCompressorManualSignChanged(sign: Int) = log("🔔 [AC监听] 压缩机手动标志变化 sign=$sign")
-        override fun onAcCompressorModeChanged(mode: Int) = log("🔔 [AC监听] 压缩机状态变化 mode=$mode")
-        override fun onAcWindModeManualSignChanged(sign: Int) = log("🔔 [AC监听] 出风模式手动标志变化 sign=$sign")
-        override fun onAcWindModeChanged(mode: Int) = log("🔔 [AC监听] 出风模式变化 mode=$mode")
-        override fun onAcWindLevelManualSignChanged(sign: Int) = log("🔔 [AC监听] 风量手动标志变化 sign=$sign")
-        override fun onAcWindLevelChanged(level: Int) = log("🔔 [AC监听] 风量变化 level=$level")
-        override fun onTemperatureUnitChanged(unit: Int) = log("🔔 [AC监听] 温度单位变化 unit=$unit")
-        override fun onAcWindModeShownStateChanged(state: Int) = log("🔔 [AC监听] 出风模式显示状态变化 state=$state")
-    }
+    // 不能像 acDevice/settingDevice/sensorDevice 那样直接写死类型，也不能
+    // 用 "private val acListener = object : AbsBYDAutoAcListener() {...}"
+    // 这种字段初始化——这个匿名类是真的继承自 AbsBYDAutoAcListener，字段
+    // 初始化会在 CarControl 构造时就立刻发生，逼着 ART 在这一刻就去解析
+    // AbsBYDAutoAcListener 这个类。simulate 构建跑在普通手机上（没有 BYD
+    // 车机框架，这个类根本不存在），"导入插件"这一步就直接
+    // "Failed resolution of AbsBYDAutoAcListener" 炸掉——比 setAcTemperature
+    // 这种方法体内部才引用车控类型的地方严重得多，那些有 try/catch 兜底
+    // （方法体内的引用是懒解析，调用那一刻才去找类，找不到能被
+    // catch(Throwable) 接住），字段初始化/继承关系是 ART 验证类的时候就要
+    // 解析的，兜不住。改成跟 acDevice 一样的懒加载：只在真正调
+    // initAcDevice() 时才 new 这个匿名类，simulate 版本下 initAcDevice()
+    // 根本不会被调用到，这个类就永远不会被 ART 摸到，自然不会报错。
+    private var acListener: AbsBYDAutoAcListener? = null
 
     fun initAcDevice(context: Context): Boolean {
         return try {
@@ -238,7 +270,29 @@ class CarControl(private val logger: KnobHost) {
             }
             log("✅ 获取 BYDAutoAcDevice 实例成功")
             enableDevice(context, acDevice!!, "AC 设备")
-            acDevice!!.registerListener(acListener)
+            val listener = acListener ?: object : AbsBYDAutoAcListener() {
+                override fun onTemperatureChanged(area: Int, value: Int) {
+                    log("🔔 [AC监听] 温度变化 area=${areaLabel(area)} value=$value")
+                    onTemperatureChangedExternal?.invoke(area, value)
+                }
+                override fun onAcStarted() = log("🔔 [AC监听] 空调开启")
+                override fun onAcStoped() = log("🔔 [AC监听] 空调关闭")
+                override fun onAcRearStarted() = log("🔔 [AC监听] 后排空调开启")
+                override fun onAcRearStoped() = log("🔔 [AC监听] 后排空调关闭")
+                override fun onAcCtrlModeChanged(mode: Int) = log("🔔 [AC监听] 控制方式(手动/自动)变化 mode=$mode")
+                override fun onAcCycleModeChanged(mode: Int) = log("🔔 [AC监听] 循环方式变化 mode=$mode")
+                override fun onAcVentilationStateChanged(state: Int) = log("🔔 [AC监听] 驻车通风变化 state=$state")
+                override fun onAcDefrostStateChanged(area: Int, state: Int) = log("🔔 [AC监听] 除霜变化 area=$area state=$state")
+                override fun onAcCompressorManualSignChanged(sign: Int) = log("🔔 [AC监听] 压缩机手动标志变化 sign=$sign")
+                override fun onAcCompressorModeChanged(mode: Int) = log("🔔 [AC监听] 压缩机状态变化 mode=$mode")
+                override fun onAcWindModeManualSignChanged(sign: Int) = log("🔔 [AC监听] 出风模式手动标志变化 sign=$sign")
+                override fun onAcWindModeChanged(mode: Int) = log("🔔 [AC监听] 出风模式变化 mode=$mode")
+                override fun onAcWindLevelManualSignChanged(sign: Int) = log("🔔 [AC监听] 风量手动标志变化 sign=$sign")
+                override fun onAcWindLevelChanged(level: Int) = log("🔔 [AC监听] 风量变化 level=$level")
+                override fun onTemperatureUnitChanged(unit: Int) = log("🔔 [AC监听] 温度单位变化 unit=$unit")
+                override fun onAcWindModeShownStateChanged(state: Int) = log("🔔 [AC监听] 出风模式显示状态变化 state=$state")
+            }.also { acListener = it }
+            acDevice!!.registerListener(listener)
             log("✅ 已注册 AC 监听器")
             true
         } catch (e: Throwable) {
@@ -249,8 +303,8 @@ class CarControl(private val logger: KnobHost) {
 
     /** 插件销毁时清理，避免监听器继续挂在已经不用的插件实例上。 */
     fun unregisterListeners() {
-        try { acDevice?.unregisterListener(acListener) } catch (e: Throwable) { log("⚠️ 取消 AC 监听器失败: ${e.message}") }
-        try { sensorDevice?.unregisterListener(sensorListener) } catch (e: Throwable) { log("⚠️ 取消 Sensor 监听器失败: ${e.message}") }
+        try { acListener?.let { acDevice?.unregisterListener(it) } } catch (e: Throwable) { log("⚠️ 取消 AC 监听器失败: ${e.message}") }
+        try { sensorListener?.let { sensorDevice?.unregisterListener(it) } } catch (e: Throwable) { log("⚠️ 取消 Sensor 监听器失败: ${e.message}") }
     }
 
     fun setAcTemperature(context: Context, area: Int, value: Int): Int? {
@@ -367,12 +421,11 @@ class CarControl(private val logger: KnobHost) {
 
     // ==================== 环境光传感器 ====================
 
-    private val sensorListener = object : AbsBYDAutoSensorListener() {
-        override fun onLightIntensityChanged(value: Int) {
-            log("🔔 [Sensor监听] 光照等级变化 level=$value")
-            onLightIntensityChangedExternal?.invoke(value)
-        }
-    }
+    // 跟 acListener 同样的懒加载理由——不能在字段初始化时就 new 一个继承
+    // 自 AbsBYDAutoSensorListener 的匿名类，否则 simulate 版本在没有 BYD
+    // 车机框架的手机上导入插件会立刻 "Failed resolution of
+    // AbsBYDAutoSensorListener"。
+    private var sensorListener: AbsBYDAutoSensorListener? = null
 
     fun initSensorDevice(context: Context): Boolean {
         return try {
@@ -383,7 +436,13 @@ class CarControl(private val logger: KnobHost) {
             }
             log("✅ 获取 BYDAutoSensorDevice 实例成功")
             enableDevice(context, sensorDevice!!, "Sensor 设备")
-            sensorDevice!!.registerListener(sensorListener)
+            val listener = sensorListener ?: object : AbsBYDAutoSensorListener() {
+                override fun onLightIntensityChanged(value: Int) {
+                    log("🔔 [Sensor监听] 光照等级变化 level=$value")
+                    onLightIntensityChangedExternal?.invoke(value)
+                }
+            }.also { sensorListener = it }
+            sensorDevice!!.registerListener(listener)
             log("✅ 已注册 Sensor 监听器")
             true
         } catch (e: Throwable) {
