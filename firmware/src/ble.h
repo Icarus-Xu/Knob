@@ -64,6 +64,12 @@ struct DisplayData {
     int16_t getInt(const char *key, int16_t defaultValue = 0) const;
     const char *getString(const char *key, const char *defaultValue = "") const;
     bool getBool(const char *key, bool defaultValue = false) const;
+
+    // 只看这次推送里有没有这个字段（不管类型），不关心值是多少。用来
+    // 区分"这次推送是不是带了某个可选字段"——比如亮度推送可能不带
+    // title，不能直接拿 getString("title","") 是不是空串来判断（正常
+    // 页面数据的 title 理论上也可能是空串）。
+    bool has(const char *key) const;
 };
 
 // 注册"手机同步了显示数据"回调：手机往自定义特征值写数据时触发。

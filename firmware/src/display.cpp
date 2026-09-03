@@ -8,6 +8,10 @@
 static uint8_t buf1[CONFIG_SCREEN_HOR_RES * 40 * 2];
 static SCREEN_CLASS *screen;
 
+// 背光 PWM 参数，跟 test_display_main.cpp 里验证过的一致。
+constexpr int BL_PWM_FREQ_HZ = 5000;
+constexpr int BL_PWM_RESOLUTION_BITS = 8; // 占空比 0~255
+
 // LVGL 每画完一块矩形区域的像素就会调这个回调。area 是这块矩形的
 // 位置和大小，px_map 是像素数据——display_init() 里把颜色格式设成了
 // RGB565_SWAPPED（大端字节序），跟 Arduino_GFX 的 draw16bitBeRGBBitmap
@@ -29,8 +33,11 @@ void display_init() {
     screen->begin();
     screen->fillScreen(RGB565_BLACK);
 
-    pinMode(TFT_BLK, OUTPUT);
-    digitalWrite(TFT_BLK, HIGH); // 打开背光
+    // 背光走 PWM（Arduino-ESP32 3.x 按引脚操作的新 ledc API），不是简单
+    // 拉高——手机端插件会根据车机光照传感器算出目标亮度推过来（见
+    // display_set_brightness），默认先给满亮度。
+    ledcAttach(TFT_BLK, BL_PWM_FREQ_HZ, BL_PWM_RESOLUTION_BITS);
+    display_set_brightness(100);
 
     // 2) 初始化 LVGL，并告诉它怎么找到刚才点亮的这块屏幕。
     lv_init();
@@ -49,4 +56,10 @@ void display_init() {
 void display_task_handler() {
     // 让 LVGL 处理定时器/动画，并把变化的像素刷到屏幕上。
     lv_timer_handler();
+}
+
+void display_set_brightness(uint8_t percent) {
+    if (percent > 100) percent = 100;
+    uint8_t duty = (uint8_t)((uint16_t)percent * 255 / 100);
+    ledcWrite(TFT_BLK, duty);
 }

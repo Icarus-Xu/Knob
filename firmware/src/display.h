@@ -15,3 +15,8 @@ void display_init();
 // LVGL 不会自己重绘，需要你定期"敲"它一下，它才会处理动画、
 // 把变化的部分刷新到屏幕上。每次 loop() 都要调用这个函数。
 void display_task_handler();
+
+// 设置背光亮度，0~100（百分比），内部换算成 PWM 占空比。display_init()
+// 里默认是 100（全亮），手机端插件根据光照传感器算出目标亮度后，通过
+// 显示数据的 "brightness" 字段推过来，main.cpp 收到后调这个。
+void display_set_brightness(uint8_t percent);

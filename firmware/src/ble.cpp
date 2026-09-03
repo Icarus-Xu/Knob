@@ -108,6 +108,13 @@ bool DisplayData::getBool(const char *key, bool defaultValue) const {
     return defaultValue;
 }
 
+bool DisplayData::has(const char *key) const {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(entries[i].key, key) == 0) return true;
+    }
+    return false;
+}
+
 // 手机往 kDisplayCharUUID 写数据时触发：解析成通用键值对，转发给
 // main.cpp 通过 ble_on_display_update() 注册的回调。
 class DisplayUpdateCallbacks : public NimBLECharacteristicCallbacks {

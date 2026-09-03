@@ -247,6 +247,17 @@ static void on_disconnected() {
 // getString() 拿到的指针也是，用完这次回调就失效，所以这里立刻复制，
 // 不能只存指针。
 static void on_display_update(const DisplayData &data) {
+    // 亮度更新是独立的一条消息，跟"当前页面显示什么值"完全无关（光照
+    // 传感器等级一变就推一次，不会带 title/value/min/max）——先处理，
+    // 不走下面页面数据那一套（不用等配对提示消失、不影响 s_screen_state）。
+    // display_set_brightness() 只是写一下 PWM 占空比，不碰 LVGL，这个
+    // 回调所在的 NimBLE 线程上直接调没问题，不用像 redraw() 那样等
+    // loop() 里再执行。
+    if (data.has("brightness")) {
+        display_set_brightness((uint8_t)data.getInt("brightness"));
+        if (!data.has("title")) return; // 纯亮度推送，没有页面数据，到此为止
+    }
+
     const char *title = data.getString("title");
     int16_t value = data.getInt("value");
     int16_t min = data.getInt("min");
