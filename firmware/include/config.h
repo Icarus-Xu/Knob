@@ -29,7 +29,8 @@
 #define ENC_PIN_B  5
 #define ENC_PIN_SW 6   // 按键，按下时接地（用内部上拉电阻）
 
-#define ENC_LONG_PRESS_MS 800  // 按住多久算"长按"
+#define ENC_LONG_PRESS_MS 1500            // 按住多久算"长按"（触发真正的提交）
+#define ENC_COMMIT_PROGRESS_START_MS 500  // 按住多久开始显示提交进度环（不是一按下就显示，避免单击也扫出一小段）
 
 // --- 开发板自带的 BOOT 键 ---
 // 接的是 GPIO0，同时也是"要不要进下载模式"的启动选脚——只有在
